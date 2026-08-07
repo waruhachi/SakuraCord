@@ -210,7 +210,11 @@ public final class VoiceAudioEngine {
         let player = try player(for: userID)
         player.scheduleBuffer(buffer)
         if !player.isPlaying {
-            try player.playAudio()
+            if #available(macOS 27.0, *) {
+                try player.playAudio()
+            } else {
+                player.play()
+            }
         }
     }
 
@@ -221,7 +225,11 @@ public final class VoiceAudioEngine {
         let player = AVAudioPlayerNode()
         player.volume = participantVolumes[userID] ?? 1
         playbackEngine.attach(player)
-        try playbackEngine.connectNode(player, to: playbackEngine.mainMixerNode, format: OpusCodec.pcmFormat)
+        if #available(macOS 27.0, *) {
+            try playbackEngine.connectNode(player, to: playbackEngine.mainMixerNode, format: OpusCodec.pcmFormat)
+        } else {
+            playbackEngine.connect(player, to: playbackEngine.mainMixerNode, format: OpusCodec.pcmFormat)
+        }
         players[userID] = player
         return player
     }

@@ -248,7 +248,7 @@ private struct ChatRootView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         }
 
         if let presentation = supplementaryToolbarPresentation {
@@ -266,7 +266,7 @@ private struct ChatRootView: View {
                     alignment: .leading
                 )
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         }
 
         if hasOpenSupplementaryConversation {
@@ -277,7 +277,7 @@ private struct ChatRootView: View {
                 }
                 .help(model.openThread == nil ? "Close voice channel chat" : "Close thread")
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         }
     }
 
@@ -331,7 +331,7 @@ private struct ChatRootView: View {
                         ? "Start Video Call" : "Join Ongoing Call with Video"
                 )
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         } else if let channel = selectedVoiceChannel, !model.isVoiceChatOpen {
             ToolbarItem {
                 Button { model.openVoiceChat(for: channel) } label: {
@@ -339,7 +339,7 @@ private struct ChatRootView: View {
                 }
                 .help("Open voice channel chat")
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         }
 
         if !hasOpenSupplementaryConversation, selectedVoiceChannel == nil {
@@ -352,7 +352,7 @@ private struct ChatRootView: View {
                     inspectorToolbarLabel
                 }
             }
-            .visibilityPriority(.high)
+            .highVisibilityPriorityIfAvailable()
         }
     }
 
@@ -623,6 +623,17 @@ private struct SupplementaryToolbarPresentation {
     let title: String
     let systemImage: String
     let subtitle: String
+}
+
+private extension ToolbarContent {
+    @ToolbarContentBuilder
+    func highVisibilityPriorityIfAvailable() -> some ToolbarContent {
+        if #available(macOS 26.1, *) {
+            visibilityPriority(.high)
+        } else {
+            self
+        }
+    }
 }
 
 private struct ConversationToolbarLabel: View {

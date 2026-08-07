@@ -40,7 +40,6 @@ extension NativeTimelineRowPainter {
             let bounds = input.bounds
             let model = input.model
             let highlighted = input.highlighted
-            let isHovered = input.isHovered
             let showsCompactTimestamp = input.showsCompactTimestamp
             let hoveredMention = input.hoveredMention
             let hoveredTextSpoiler = input.hoveredTextSpoiler

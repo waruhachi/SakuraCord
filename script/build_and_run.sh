@@ -33,6 +33,7 @@ MACOS="$CONTENTS/MacOS"
 FRAMEWORKS="$CONTENTS/Frameworks"
 RESOURCES="$CONTENTS/Resources"
 PRODUCT_NAME="$SAKURACORD_PRODUCT_NAME"
+MINIMUM_MACOS_VERSION="26.0"
 BUNDLE_SHORT_VERSION="$(sakuracord_release_version "$ROOT_DIR")"
 BUNDLE_BUILD_VERSION="${SAKURACORD_BUILD_NUMBER:-1}"
 if [[ ! "$BUNDLE_BUILD_VERSION" =~ ^[0-9]+$ ]]; then
@@ -149,7 +150,7 @@ ICON_PARTIAL_PLIST="$DIST_DIR/SakuraCordIcon-Info.plist"
 xcrun actool \
   --compile "$RESOURCES" \
   --platform macosx \
-  --minimum-deployment-target 27.0 \
+  --minimum-deployment-target "$MINIMUM_MACOS_VERSION" \
   --app-icon "$APP_ICON_NAME" \
   --output-partial-info-plist "$ICON_PARTIAL_PLIST" \
   --warnings --notices --errors \
@@ -170,7 +171,7 @@ cat >"$CONTENTS/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$BUNDLE_SHORT_VERSION</string>
   <key>CFBundleVersion</key><string>$BUNDLE_BUILD_VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>27.0</string>
+  <key>LSMinimumSystemVersion</key><string>$MINIMUM_MACOS_VERSION</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>SakuraCord uses your microphone when you join a voice call.</string>
