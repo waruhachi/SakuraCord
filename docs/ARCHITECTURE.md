@@ -154,5 +154,7 @@ unchanged DMG, preserves its build number, regenerates and verifies the signed
 appcast with the current body, and replaces only the appcast asset. The two
 release paths share per-tag concurrency so this refresh cannot race the initial
 publication. Maintainers can dispatch the same workflow with a tag to repair an
-older feed. The public feed is
+older feed. GitHub Actions binds the signed feed and packaged app to the
+repository running the workflow, so fork releases cannot reference another
+repository's artifacts. The canonical public feed is
 `https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml`.

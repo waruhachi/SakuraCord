@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=release_metadata.sh
 source "$ROOT_DIR/script/release_metadata.sh"
 RELEASE_VERSION="$(sakuracord_release_version "$ROOT_DIR")"
+RELEASE_BASE_URL="$(sakuracord_release_base_url)"
 DMG_NAME="$(sakuracord_release_dmg_name "$RELEASE_VERSION")"
 APPCAST_PATH="${1:-$ROOT_DIR/dist/appcast.xml}"
 DMG_PATH="${2:-$ROOT_DIR/dist/$DMG_NAME}"
@@ -95,7 +96,7 @@ fi
 EXPECTED_DMG_URL_NAME="$(
   sakuracord_release_dmg_url_name "$SAKURACORD_VERSION"
 )"
-EXPECTED_URL="https://github.com/SakuraCordApp/SakuraCord/releases/download/$EXPECTED_TAG/$EXPECTED_DMG_URL_NAME"
+EXPECTED_URL="$RELEASE_BASE_URL/releases/download/$EXPECTED_TAG/$EXPECTED_DMG_URL_NAME"
 if [[ "$ENCLOSURE_URL" != "$EXPECTED_URL" ]]; then
   echo "Unexpected appcast enclosure URL: $ENCLOSURE_URL" >&2
   exit 1
@@ -112,7 +113,7 @@ if [[ "$APPCAST_HAS_RELEASE_NOTES" != "true" ]]; then
   echo "The appcast does not contain embedded release notes." >&2
   exit 1
 fi
-EXPECTED_RELEASE_URL="https://github.com/SakuraCordApp/SakuraCord/releases/tag/$EXPECTED_TAG"
+EXPECTED_RELEASE_URL="$RELEASE_BASE_URL/releases/tag/$EXPECTED_TAG"
 if [[ "$APPCAST_FULL_RELEASE_NOTES_URL" != "$EXPECTED_RELEASE_URL" ]]; then
   echo "Unexpected full release notes URL: $APPCAST_FULL_RELEASE_NOTES_URL" >&2
   exit 1
@@ -163,7 +164,7 @@ assert_plist_value "CFBundleVersion" "$SAKURACORD_BUILD_NUMBER"
 assert_plist_value "CFBundleShortVersionString" "$SAKURACORD_VERSION"
 assert_plist_value "SakuraCordUpdatesEnabled" "true"
 assert_plist_value "SUFeedURL" \
-  "https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml"
+  "$RELEASE_BASE_URL/releases/latest/download/appcast.xml"
 assert_plist_value "SUPublicEDKey" "$SPARKLE_ED_PUBLIC_KEY"
 assert_plist_value "SUEnableAutomaticChecks" "true"
 assert_plist_value "SUScheduledCheckInterval" "21600"

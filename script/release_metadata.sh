@@ -39,3 +39,18 @@ sakuracord_release_dmg_url_name() {
   local version="$1"
   sakuracord_release_dmg_name "$version"
 }
+
+sakuracord_release_repository() {
+  local repository="${SAKURACORD_RELEASE_REPOSITORY:-SakuraCordApp/SakuraCord}"
+
+  if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "SAKURACORD_RELEASE_REPOSITORY must use OWNER/REPOSITORY." >&2
+    return 2
+  fi
+
+  printf '%s\n' "$repository"
+}
+
+sakuracord_release_base_url() {
+  printf 'https://github.com/%s\n' "$(sakuracord_release_repository)"
+}

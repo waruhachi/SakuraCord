@@ -77,6 +77,7 @@ if [[ "$UPDATES_ENABLED" == "1" ]]; then
     echo "SPARKLE_ED_PUBLIC_KEY must be a base64-encoded 32-byte Ed25519 public key." >&2
     exit 2
   fi
+  RELEASE_BASE_URL="$(sakuracord_release_base_url)"
 fi
 BUILD_FLAGS=()
 if [[ "$MODE" == "package-release" ]]; then
@@ -183,7 +184,7 @@ PLIST
 if [[ "$UPDATES_ENABLED" == "1" ]]; then
   /usr/libexec/PlistBuddy -c "Add :SakuraCordUpdatesEnabled bool true" "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c \
-    "Add :SUFeedURL string https://github.com/SakuraCordApp/SakuraCord/releases/latest/download/appcast.xml" \
+    "Add :SUFeedURL string $RELEASE_BASE_URL/releases/latest/download/appcast.xml" \
     "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_ED_PUBLIC_KEY" "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SUEnableAutomaticChecks bool true" "$CONTENTS/Info.plist"

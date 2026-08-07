@@ -23,6 +23,7 @@ if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
 fi
 
 RELEASE_VERSION="$(sakuracord_release_version "$ROOT_DIR")"
+RELEASE_BASE_URL="$(sakuracord_release_base_url)"
 DMG_NAME="$(sakuracord_release_dmg_name "$RELEASE_VERSION")"
 DMG_PATH="${1:-$ROOT_DIR/dist/$DMG_NAME}"
 OUTPUT_PATH="${2:-$ROOT_DIR/dist/appcast.xml}"
@@ -72,8 +73,8 @@ ditto "$DMG_PATH" "$STAGING_DIR/$DMG_NAME"
   cat "$RELEASE_NOTES_PATH"
 } >"$STAGING_DIR/${DMG_NAME%.dmg}.md"
 
-DOWNLOAD_URL_PREFIX="https://github.com/SakuraCordApp/SakuraCord/releases/download/$RELEASE_TAG/"
-RELEASE_URL="https://github.com/SakuraCordApp/SakuraCord/releases/tag/$RELEASE_TAG"
+DOWNLOAD_URL_PREFIX="$RELEASE_BASE_URL/releases/download/$RELEASE_TAG/"
+RELEASE_URL="$RELEASE_BASE_URL/releases/tag/$RELEASE_TAG"
 printf '%s\n' "$SPARKLE_ED_PRIVATE_KEY" | "$GENERATE_APPCAST" \
   --ed-key-file - \
   --download-url-prefix "$DOWNLOAD_URL_PREFIX" \
