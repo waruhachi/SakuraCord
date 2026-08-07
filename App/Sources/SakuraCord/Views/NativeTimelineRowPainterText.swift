@@ -838,10 +838,9 @@ extension NativeTimelineRowPainter {
             if let url = presentation.avatarURL,
                let image = mediaImage(for: .avatar(url))
             {
-                drawImage(
+                drawCircularImage(
                     image,
                     in: avatarFrame,
-                    cornerRadius: avatarSize / 2,
                     fillsFrame: true
                 )
             } else {

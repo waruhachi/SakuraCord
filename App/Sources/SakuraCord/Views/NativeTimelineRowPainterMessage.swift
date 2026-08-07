@@ -571,7 +571,7 @@ extension NativeTimelineRowPainter {
         if let url,
            let image = mediaImage(for: .avatar(url))
         {
-            drawImage(image, in: frame, cornerRadius: frame.width / 2, fillsFrame: true)
+            drawCircularImage(image, in: frame, fillsFrame: true)
             return
         }
         NSGraphicsContext.saveGraphicsState()

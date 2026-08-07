@@ -888,6 +888,36 @@ extension NativeTimelineRowPainter {
         cornerRadius: CGFloat,
         fillsFrame: Bool
     ) {
+        drawImage(
+            image,
+            in: frame,
+            clipPath: NSBezierPath(
+                concentricRoundedRect: frame,
+                cornerRadius: cornerRadius
+            ),
+            fillsFrame: fillsFrame
+        )
+    }
+
+    static func drawCircularImage(
+        _ image: NSImage,
+        in frame: CGRect,
+        fillsFrame: Bool
+    ) {
+        drawImage(
+            image,
+            in: frame,
+            clipPath: NSBezierPath(ovalIn: frame),
+            fillsFrame: fillsFrame
+        )
+    }
+
+    private static func drawImage(
+        _ image: NSImage,
+        in frame: CGRect,
+        clipPath: NSBezierPath,
+        fillsFrame: Bool
+    ) {
         guard frame.width > 0, frame.height > 0,
               image.size.width > 0, image.size.height > 0
         else { return }
@@ -901,10 +931,7 @@ extension NativeTimelineRowPainter {
             height: image.size.height * scale
         )
         NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(
-            concentricRoundedRect: frame,
-            cornerRadius: cornerRadius
-        ).addClip()
+        clipPath.addClip()
         image.draw(
             in: destination,
             from: .zero,
