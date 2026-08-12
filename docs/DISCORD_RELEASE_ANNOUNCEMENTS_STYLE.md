@@ -110,4 +110,6 @@ same review. Make their different scope explicit. Do not write
 `Releases/vX.Y.Z.json` until the maintainer approves the copy unless they
 explicitly asked to save immediately. After approval, store only the authored
 embed description in `discordAnnouncement`; the action adds all generated
-framing at publication time.
+framing at publication time. If the maintainer will handle the announcement
+outside the release action, omit `discordAnnouncement` from the release-copy
+file so the action skips Discord publication.

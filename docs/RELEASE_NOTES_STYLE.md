@@ -94,4 +94,6 @@ SakuraCord vX.Y.Z adds [major features]. It also improves [important areas].
 Present the complete draft to the maintainer for revision before writing a
 release-copy file unless the maintainer explicitly asked to save immediately.
 After approval, store the exact reviewed Markdown in `githubDescription` within
-`Releases/vX.Y.Z.json`. Do not silently rewrite it into Discord copy.
+`Releases/vX.Y.Z.json`. Do not silently rewrite it into Discord copy. When the
+maintainer will publish the Discord announcement separately, omit
+`discordAnnouncement`; the release action will skip Discord publication.

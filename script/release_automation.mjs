@@ -31,20 +31,22 @@ export function validateReleaseCopy(value, expectedTag) {
   if (expectedTag && tagName !== expectedTag) {
     throw new Error(`Release copy belongs to ${tagName}, not ${expectedTag}.`);
   }
-  const limits = {
-    githubDescription: 20_000,
-    discordAnnouncement: 3_800,
-  };
-  const copy = { schemaVersion: 1, tagName };
-  for (const [key, maximum] of Object.entries(limits)) {
-    const text = value[key];
-    if (typeof text !== "string" || !text.trim() || text.length > maximum) {
-      throw new Error(`${key} must contain between 1 and ${maximum} characters.`);
-    }
-    copy[key] = text.trim();
+  const githubDescription = requiredString(value.githubDescription, "githubDescription");
+  if (githubDescription.length > 20_000) {
+    throw new Error("githubDescription must contain between 1 and 20000 characters.");
   }
-  copy.discordAnnouncement = stripDiscordMentions(copy.discordAnnouncement);
-  validateDiscordAnnouncementLayout(copy.discordAnnouncement);
+  const copy = { schemaVersion: 1, tagName, githubDescription };
+  if (value.discordAnnouncement !== undefined) {
+    const discordAnnouncement = requiredString(
+      value.discordAnnouncement,
+      "discordAnnouncement",
+    );
+    if (discordAnnouncement.length > 3_800) {
+      throw new Error("discordAnnouncement must contain between 1 and 3800 characters.");
+    }
+    copy.discordAnnouncement = stripDiscordMentions(discordAnnouncement);
+    validateDiscordAnnouncementLayout(copy.discordAnnouncement);
+  }
   return copy;
 }
 
@@ -61,6 +63,10 @@ export function prepareReleaseCopy(value, expectedTag) {
 
 export function createDiscordPayload(copy, repository, releaseId, releaseUrl, roleId) {
   const validated = validateReleaseCopy(copy);
+  const discordAnnouncement = requiredString(
+    validated.discordAnnouncement,
+    "discordAnnouncement",
+  );
   const nonce = createHash("sha256")
     .update(`release:${repository}:${releaseId}`)
     .digest("hex")
@@ -70,7 +76,7 @@ export function createDiscordPayload(copy, repository, releaseId, releaseUrl, ro
     embeds: [
       {
         title: `SakuraCord ${validated.tagName}`,
-        description: validated.discordAnnouncement,
+        description: discordAnnouncement,
         color: 0xce6096,
       },
     ],

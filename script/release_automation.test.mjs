@@ -58,6 +58,24 @@ test("preserves hand-written notes and appends only the ownership marker", () =>
   assert.equal(prepared.githubDescription.match(/sakuracord-release-action/g)?.length, 1);
 });
 
+test("permits a maintainer-managed Discord announcement", () => {
+  const copy = releaseCopy();
+  delete copy.discordAnnouncement;
+  const validated = validateReleaseCopy(copy, "v0.1.2");
+  assert.equal(validated.discordAnnouncement, undefined);
+  assert.throws(
+    () =>
+      createDiscordPayload(
+        validated,
+        "SakuraCordApp/SakuraCord",
+        123,
+        "https://github.com/SakuraCordApp/SakuraCord/releases/tag/v0.1.2",
+        "1528177363995590795",
+      ),
+    /discordAnnouncement is missing/,
+  );
+});
+
 test("sanitizes pre-made Discord mentions and constrains allowed mentions", () => {
   const copy = validateReleaseCopy(
     releaseCopy({

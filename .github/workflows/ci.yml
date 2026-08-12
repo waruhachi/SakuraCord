@@ -77,7 +77,8 @@ jobs:
           echo "SAKURACORD_RELEASE_CONTROL_ROOT=$release_control_root" >> "$GITHUB_ENV"
           echo "SAKURACORD_RELEASE_COPY=$release_copy" >> "$GITHUB_ENV"
           echo "SAKURACORD_DMG_PATH=dist/SakuraCord.v$version.dmg" >> "$GITHUB_ENV"
-      - name: Prepare exact release notes and Discord copy
+      - name: Prepare exact release notes and optional Discord copy
+        id: release_copy
         run: |
           mkdir -p dist
           node "$SAKURACORD_RELEASE_CONTROL_ROOT/script/release_automation.mjs" prepare \
@@ -85,6 +86,11 @@ jobs:
             --tag "$SAKURACORD_RELEASE_TAG" \
             --output dist/release-copy.json \
             --notes-output dist/release-notes.md
+          if jq -e 'has("discordAnnouncement")' dist/release-copy.json >/dev/null; then
+            echo "announce_discord=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "announce_discord=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Inspect existing release checkpoints
         id: existing_release
         env:
@@ -198,7 +204,7 @@ jobs:
           echo "id=$(jq -r .databaseId <<< "$release_json")" >> "$GITHUB_OUTPUT"
           echo "url=$(jq -r .url <<< "$release_json")" >> "$GITHUB_OUTPUT"
       - name: Send the pre-made Discord release announcement
-        if: steps.existing_release.outputs.announced != 'true'
+        if: steps.release_copy.outputs.announce_discord == 'true' && steps.existing_release.outputs.announced != 'true'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_RELEASE_CHANNEL_ID: ${{ secrets.DISCORD_RELEASE_CHANNEL_ID }}
