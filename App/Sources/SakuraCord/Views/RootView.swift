@@ -917,17 +917,6 @@ private struct SupplementaryToolbarPresentation {
     let subtitle: String
 }
 
-private extension ToolbarContent {
-    @ToolbarContentBuilder
-    func highVisibilityPriorityIfAvailable() -> some ToolbarContent {
-        if #available(macOS 26.1, *) {
-            visibilityPriority(.high)
-        } else {
-            self
-        }
-    }
-}
-
 private struct ConversationToolbarLabel: View {
     let title: String
     let systemImage: String

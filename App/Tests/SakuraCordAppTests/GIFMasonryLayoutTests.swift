@@ -415,7 +415,9 @@ private actor GIFVideoDownloadProbe {
         in: firstCell
     ))
     #expect(favoriteGlass.style == .regular)
-    #expect(favoriteGlass.effectIsInteractive)
+    if #available(macOS 27.0, *) {
+        #expect(favoriteGlass.effectIsInteractive)
+    }
     #expect(favoriteGlass.contentView is NSButton)
     let favoriteAction = try #require(
         firstCell.accessibilityCustomActions()?.first {

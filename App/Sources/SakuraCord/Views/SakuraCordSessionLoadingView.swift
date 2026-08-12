@@ -288,7 +288,7 @@ struct SakuraCordSessionLoadingView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
         }
-        .visibilityPriority(.high)
+        .highVisibilityPriorityIfAvailable()
     }
 
     @ToolbarContentBuilder
@@ -303,7 +303,7 @@ struct SakuraCordSessionLoadingView: View {
             .padding(.vertical, 5)
             .fixedSize()
         }
-        .visibilityPriority(.high)
+        .highVisibilityPriorityIfAvailable()
     }
 
     private var detail: String {
