@@ -2,6 +2,9 @@ import Foundation
 import GRDB
 import SakuraCordModels
 
+/// Per-account storage is intentionally limited to user-authored state.
+/// Discord workspace, message, read, and Gateway state belongs to the running
+/// session and is never written here.
 public actor SakuraCordDatabase {
     private let queue: DatabaseQueue
 
@@ -17,56 +20,39 @@ public actor SakuraCordDatabase {
         try Self.migrator.migrate(queue)
     }
 
-    public func save(messages: [Message]) throws {
-        try queue.write { db in
-            for message in messages {
-                try MessageRecord(message).save(db)
-            }
-        }
-    }
-
-    public func deleteMessage(_ messageID: MessageID) throws {
-        try queue.write { db in
-            _ = try MessageRecord.deleteOne(db, key: messageID.description)
-        }
-    }
-
-    public func messages(in channelID: ChannelID, limit: Int = 100) throws -> [Message] {
-        try queue.read { db in
-            let records = try MessageRecord
-                .filter(Column("channelID") == channelID.description)
-                .order(Column("timestamp").desc)
-                .limit(limit)
-                .fetchAll(db)
-            // A cache entry written by an older model version must never prevent
-            // the channel from falling through to a fresh Discord fetch.
-            return records.reversed().compactMap { try? $0.message() }
-        }
-    }
-
     public func saveDraft(_ content: String, channelID: ChannelID) throws {
         try queue.write { db in
             if content.isEmpty {
                 _ = try DraftRecord.deleteOne(db, key: channelID.description)
             } else {
-                try DraftRecord(channelID: channelID.description, content: content, updatedAt: .now).save(db)
+                try DraftRecord(
+                    channelID: channelID.description,
+                    content: content,
+                    updatedAt: .now
+                ).save(db)
             }
         }
     }
 
     public func draft(channelID: ChannelID) throws -> String {
-        try queue.read { db in try DraftRecord.fetchOne(db, key: channelID.description)?.content ?? "" }
+        try queue.read { db in
+            try DraftRecord.fetchOne(db, key: channelID.description)?.content ?? ""
+        }
     }
 
     public func clearAccountData() throws {
-        try queue.write { db in
-            try MessageRecord.deleteAll(db)
+        _ = try queue.write { db in
             try DraftRecord.deleteAll(db)
         }
     }
 
     private static func defaultDirectory() throws -> URL {
-        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
         return base.appending(path: "SakuraCord/Accounts", directoryHint: .isDirectory)
     }
 
@@ -98,26 +84,44 @@ public actor SakuraCordDatabase {
                 columns: ["channelID", "timestamp"]
             )
         }
+        migrator.registerMigration("v3-conversation-page-boundary") { db in
+            try db.create(table: "conversationPages") { table in
+                table.primaryKey("channelID", .text)
+                table.column("hasMoreBefore", .boolean).notNull()
+            }
+        }
+        migrator.registerMigration("v4-bootstrap-snapshot") { db in
+            try db.create(table: "bootstrapSnapshots") { table in
+                table.primaryKey("id", .integer)
+                table.column("payload", .blob).notNull()
+                table.column("updatedAt", .datetime).notNull()
+            }
+        }
+        migrator.registerMigration("v5-account-presentation") { db in
+            try db.create(table: "accountPresentation") { table in
+                table.primaryKey("id", .integer)
+                table.column("selectedChannelID", .text).notNull()
+            }
+        }
+        // These names are retained so databases created by older builds keep a
+        // monotonic migration history. Their derived-cache work is obsolete.
+        migrator.registerMigration("v6-message-snowflake-order") { _ in }
+        migrator.registerMigration("v7-refresh-bootstrap-unread-cache") { _ in }
+        migrator.registerMigration("v8-session-only-cache") { db in
+            try db.execute(sql: "DELETE FROM accountPresentation")
+            try db.execute(sql: "DELETE FROM bootstrapSnapshots")
+            try db.execute(sql: "DELETE FROM conversationPages")
+            try db.execute(sql: "DELETE FROM gatewaySession")
+            try db.execute(sql: "DELETE FROM messages")
+        }
+        migrator.registerMigration("v9-drop-persistent-discord-cache") { db in
+            try db.drop(table: "accountPresentation")
+            try db.drop(table: "bootstrapSnapshots")
+            try db.drop(table: "conversationPages")
+            try db.drop(table: "gatewaySession")
+            try db.drop(table: "messages")
+        }
         return migrator
-    }
-}
-
-private struct MessageRecord: Codable, FetchableRecord, PersistableRecord {
-    static let databaseTableName = "messages"
-    var id: String
-    var channelID: String
-    var timestamp: Date
-    var payload: Data
-
-    init(_ message: Message) throws {
-        id = message.id.description
-        channelID = message.channelID.description
-        timestamp = message.timestamp
-        payload = try JSONEncoder().encode(message)
-    }
-
-    func message() throws -> Message {
-        try JSONDecoder().decode(Message.self, from: payload)
     }
 }
 

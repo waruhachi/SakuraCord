@@ -1,67 +1,156 @@
 import DiscordProtocol
 import Foundation
 import ImageIO
+import MediaPipeline
 import MessageRendering
 import SakuraCordModels
 import SakuraCordPersistence
 import UniformTypeIdentifiers
 
-final class MessagePersistenceSink: @unchecked Sendable {
-    private static let batchInterval: Duration = .milliseconds(100)
+struct AppModelAccountSession {
+    let generation: UInt64
+    let installedRevision: UInt64
+    let allowsTransition: Bool
+    let provider: any ChatProvider
+    let database: SakuraCordDatabase?
+}
 
-    private enum Event: Sendable {
-        case save(SakuraCordDatabase, Message)
-        case flush
+struct AppModelVoiceOperationIdentity {
+    let generation: Int
+    let channelID: ChannelID?
+    let session: DiscordVoiceSession?
+}
+
+actor AccountTransitionCoordinator {
+    private var isAcquired = false
+
+    func acquireIfAvailable() -> Bool {
+        guard !isAcquired else { return false }
+        isAcquired = true
+        return true
     }
 
-    private struct PendingBatch {
-        let database: SakuraCordDatabase
-        var messages: [Message] = []
+    func release() {
+        isAcquired = false
+    }
+}
+
+extension AppModel {
+    func accountSession(allowsTransition: Bool = false) -> AppModelAccountSession {
+        let isBlockedTransition = accountTransitionIsActive && !allowsTransition
+        return AppModelAccountSession(
+            generation: accountSessionGeneration,
+            installedRevision: installedAccountSessionRevision,
+            allowsTransition: allowsTransition,
+            provider: isBlockedTransition ? SignedOutChatProvider() : provider,
+            database: isBlockedTransition ? nil : database
+        )
     }
 
-    private let continuation: AsyncStream<Event>.Continuation
-    private let worker: Task<Void, Never>
+    func isCurrentAccountSession(_ session: AppModelAccountSession) -> Bool {
+        accountSessionGeneration == session.generation
+            && installedAccountSessionRevision == session.installedRevision
+            && (!accountTransitionIsActive || session.allowsTransition)
+    }
 
-    init() {
-        let (stream, continuation) = AsyncStream.makeStream(of: Event.self)
-        self.continuation = continuation
-        worker = Task.detached(priority: .background) {
-            var batches: [ObjectIdentifier: PendingBatch] = [:]
-            var flushScheduled = false
-            for await event in stream {
-                switch event {
-                case let .save(database, message):
-                    let key = ObjectIdentifier(database)
-                    if batches[key] == nil {
-                        batches[key] = PendingBatch(database: database)
-                    }
-                    batches[key]?.messages.append(message)
-                    guard !flushScheduled else { continue }
-                    flushScheduled = true
-                    Task.detached(priority: .background) {
-                        try? await Task.sleep(for: Self.batchInterval)
-                        continuation.yield(.flush)
-                    }
-                case .flush:
-                    let pending = Array(batches.values)
-                    batches.removeAll(keepingCapacity: true)
-                    flushScheduled = false
-                    for batch in pending {
-                        try? await batch.database.save(messages: batch.messages)
-                    }
-                }
-            }
+    func invalidateAccountSession() {
+        accountSessionGeneration &+= 1
+    }
+
+    func installAccountSession(
+        provider: any ChatProvider,
+        database: SakuraCordDatabase?
+    ) {
+        self.provider = provider
+        self.database = database
+        installedAccountSessionRevision &+= 1
+    }
+
+    @discardableResult
+    func startAccountChildTask(
+        account: AppModelAccountSession,
+        operation: @escaping @MainActor (
+            _ model: AppModel,
+            _ account: AppModelAccountSession
+        ) async -> Void
+    ) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.accountChildTasks[id] = nil }
+            guard let self,
+                  !Task.isCancelled,
+                  isCurrentAccountSession(account)
+            else { return }
+            await operation(self, account)
+        }
+        accountChildTasks[id] = task
+        return task
+    }
+
+    func cancelAccountChildTasks() {
+        for task in accountChildTasks.values {
+            task.cancel()
         }
     }
 
-    deinit {
-        continuation.finish()
-        worker.cancel()
+    func drainAccountChildTasks() async {
+        let tasks = Array(accountChildTasks.values)
+        for task in tasks {
+            task.cancel()
+        }
+        for task in tasks {
+            await task.value
+        }
+        accountChildTasks.removeAll(keepingCapacity: false)
     }
 
-    func enqueue(_ message: Message, database: SakuraCordDatabase?) {
-        guard let database else { return }
-        continuation.yield(.save(database, message))
+    func currentVoiceOperationIdentity() -> AppModelVoiceOperationIdentity {
+        AppModelVoiceOperationIdentity(
+            generation: voiceMigrationGeneration,
+            channelID: activeVoiceChannel?.id,
+            session: voiceSession
+        )
+    }
+
+    func isCurrentVoiceOperation(
+        _ account: AppModelAccountSession,
+        identity: AppModelVoiceOperationIdentity
+    ) -> Bool {
+        guard isCurrentAccountSession(account),
+              voiceMigrationGeneration == identity.generation,
+              activeVoiceChannel?.id == identity.channelID
+        else { return false }
+        if let expectedSession = identity.session {
+            return voiceSession === expectedSession
+        }
+        return voiceSession == nil
+    }
+
+    func observePrivateCall(
+        in channel: Channel,
+        account: AppModelAccountSession
+    ) async {
+        guard channel.kind == .directMessage || channel.kind == .groupDirectMessage else {
+            return
+        }
+        guard !Task.isCancelled, isCurrentAccountSession(account) else { return }
+        do {
+            try await account.provider.subscribeToPrivateCall(channelID: channel.id)
+            guard !Task.isCancelled, isCurrentAccountSession(account) else { return }
+        } catch {
+            // Observation is opportunistic while the Gateway is reconnecting.
+            // Connection-ready reconciliation will subscribe again.
+        }
+    }
+
+    func resetAppSounds() {
+        resetPrivateCallActions()
+        for task in outgoingPrivateCallRingTimeoutTasks.values {
+            task.cancel()
+        }
+        outgoingPrivateCallRingTimeoutTasks = [:]
+        locallyStartedOutgoingPrivateCallRings = []
+        soundPlayer.stopAll()
     }
 }
 
@@ -651,6 +740,7 @@ nonisolated enum LocalHistoryMemberResolution {
 
 nonisolated enum ChannelMessageCachePolicy {
     static let maximumChannelCount = 8
+    static let maximumPreparedChannelCount = 3
     static let maximumMessageCountPerChannel = 250
 
     static func retainedMessages(from messages: [Message]) -> [Message] {
@@ -658,5 +748,63 @@ nonisolated enum ChannelMessageCachePolicy {
             return messages
         }
         return Array(messages.suffix(maximumMessageCountPerChannel))
+    }
+}
+
+/// Reduces a live guild-member update to the fields that can actually change
+/// pixels or geometry in a message row. Presence, activity, list grouping,
+/// and other inspector-only churn must not invalidate the timeline.
+nonisolated enum TimelineMemberPresentationImpact {
+    struct Signature: Equatable {
+        let user: User
+        let guildAvatarURL: URL?
+        let roleColorHex: UInt32?
+    }
+
+    static func changedUserIDs(
+        from oldMembers: [UserID: Member],
+        to newMembers: [UserID: Member],
+        guildRoles: [GuildRole]
+    ) -> Set<UserID> {
+        let candidates = Set(oldMembers.keys).union(newMembers.keys)
+        return Set(candidates.filter { userID in
+            signature(for: oldMembers[userID], guildRoles: guildRoles)
+                != signature(for: newMembers[userID], guildRoles: guildRoles)
+        })
+    }
+
+    static func affectedMessageIDs(
+        in messages: [Message],
+        changedUserIDs: Set<UserID>
+    ) -> Set<MessageID> {
+        guard !changedUserIDs.isEmpty else { return [] }
+        return Set(messages.lazy.compactMap { message in
+            guard changedUserIDs.contains(message.author.id)
+                    || message.replyPreview.map({
+                        changedUserIDs.contains($0.author.id)
+                    }) == true
+                    || message.mentionedUsers.contains(where: {
+                        changedUserIDs.contains($0.id)
+                    })
+            else { return nil }
+            return message.id
+        })
+    }
+
+    private static func signature(
+        for member: Member?,
+        guildRoles: [GuildRole]
+    ) -> Signature? {
+        guard let member else { return nil }
+        let roleIDs = Set(member.roleIDs)
+        return Signature(
+            user: member.user,
+            guildAvatarURL: member.guildAvatarURL,
+            roleColorHex:
+                MessageAuthorPresentation.topRoleColor(in: member.roles)
+                    ?? MessageAuthorPresentation.topRoleColor(
+                        in: guildRoles.filter { roleIDs.contains($0.id) }
+                    )
+        )
     }
 }

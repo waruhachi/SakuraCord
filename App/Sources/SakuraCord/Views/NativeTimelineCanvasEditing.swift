@@ -37,6 +37,22 @@ extension NativeTimelineCanvasView {
         }
     }
 
+    func setHoveredTextLink(
+        _ value: NativeTimelineTextLinkHover?
+    ) {
+        guard hoveredTextLink != value else { return }
+        let oldIdentifier = hoveredTextLink?.itemIdentifier
+        hoveredTextLink = value
+        for identifier
+            in [oldIdentifier, value?.itemIdentifier].compactMap({ $0 })
+        {
+            guard let index = items.firstIndex(where: {
+                $0.identifier == identifier
+            }) else { continue }
+            setNeedsDisplay(rowFrame(at: index))
+        }
+    }
+
     func setHoveredTextSpoiler(
         _ value: NativeTimelineTextSpoilerHover?
     ) {
@@ -77,6 +93,18 @@ extension NativeTimelineCanvasView {
         hoveredComponentButton = value
         for target in [old, value].compactMap({ $0 }) {
             invalidateComponentButton(target)
+        }
+    }
+
+    func setHoveredForwardedSourceMessageID(_ value: MessageID?) {
+        guard hoveredForwardedSourceMessageID != value else { return }
+        let old = hoveredForwardedSourceMessageID
+        hoveredForwardedSourceMessageID = value
+        for messageID in [old, value].compactMap({ $0 }) {
+            guard let index = items.firstIndex(where: {
+                $0.messageID == messageID
+            }) else { continue }
+            setNeedsDisplay(rowFrame(at: index))
         }
     }
 
@@ -152,6 +180,19 @@ extension NativeTimelineCanvasView {
     }
 
     func reconcileActionCapsule() {
+        if actionCapsuleState?.isPresentationActive == true {
+            guard editingMessageID == nil,
+                  let messageID = actionCapsuleMessageID,
+                  let index = items.firstIndex(where: {
+                      $0.messageID == messageID
+                  })
+            else {
+                removeActionCapsule()
+                return
+            }
+            positionActionCapsule(at: index)
+            return
+        }
         guard editingMessageID == nil,
               let index = hoveredRow,
               items.indices.contains(index),
@@ -159,7 +200,7 @@ extension NativeTimelineCanvasView {
               let model,
               let actions
         else {
-            if actionCapsuleState?.isReactionPickerPresented != true {
+            if actionCapsuleState?.isPresentationActive != true {
                 removeActionCapsule()
             }
             return
@@ -172,10 +213,18 @@ extension NativeTimelineCanvasView {
         removeActionCapsule()
 
         let state = NativeTimelineActionCapsuleState()
-        state.presentationDidChange = { [weak self] isPresented in
-            guard let self else { return }
-            if !isPresented, self.hoveredRow == nil {
-                self.removeActionCapsule()
+        state.presentationDidChange = { [weak self, weak state] isPresented in
+            Task { @MainActor [weak self, weak state] in
+                await Task.yield()
+                guard let self,
+                      let state,
+                      self.actionCapsuleState === state
+                else { return }
+                if isPresented {
+                    self.refreshActionCapsuleSizeAndPosition()
+                } else {
+                    self.reconcileActionCapsule()
+                }
             }
         }
         let canEdit = row.message.author.id == model.snapshot?.currentUser.id
@@ -193,6 +242,9 @@ extension NativeTimelineCanvasView {
             reply: actions.reply.map { reply in
                 { reply(row.message) }
             },
+            forward: model.canForward(row.message) ? actions.forward.map { forward in
+                { forward(row.message) }
+            } : nil,
             react: { emoji in actions.react(emoji, row.message) },
             copy: { Self.copyText(row.message.content) },
             copyLink: { [weak self] in
@@ -202,7 +254,7 @@ extension NativeTimelineCanvasView {
             openThread: row.message.thread.map { thread in
                 { actions.openThread(thread) }
             },
-            delete: { [weak self] in self?.confirmDelete(row.message) }
+            delete: { actions.delete(row.message) }
         )
         // The canvas owns the capsule's exact document-coordinate frame.
         // Nested thread timelines extend beneath their top toolbar, so this
@@ -217,13 +269,18 @@ extension NativeTimelineCanvasView {
         actionCapsuleState = state
         actionCapsuleHost = host
         actionCapsuleMessageID = row.id
+        refreshActionCapsuleSizeAndPosition(at: index)
+    }
+
+    func refreshActionCapsuleSizeAndPosition(at knownIndex: Int? = nil) {
+        guard let host = actionCapsuleHost else { return }
         host.layoutSubtreeIfNeeded()
         let fitting = host.fittingSize
         actionCapsuleSize = NSSize(
             width: max(36, fitting.width),
             height: max(36, fitting.height)
         )
-        positionActionCapsule(at: index)
+        positionActionCapsule(at: knownIndex)
     }
 
     func positionActionCapsule(at knownIndex: Int? = nil) {
@@ -336,6 +393,29 @@ extension NativeTimelineCanvasView {
         for item: NativeMessageTimelineItem,
         layout: NativeTimelineRowLayout
     ) -> [SelectableTextRegion] {
+        textRegions(
+            for: item,
+            layout: layout,
+            includesNonSelectable: false
+        )
+    }
+
+    func linkPointerTextRegions(
+        for item: NativeMessageTimelineItem,
+        layout: NativeTimelineRowLayout
+    ) -> [SelectableTextRegion] {
+        textRegions(
+            for: item,
+            layout: layout,
+            includesNonSelectable: true
+        )
+    }
+
+    private func textRegions(
+        for item: NativeMessageTimelineItem,
+        layout: NativeTimelineRowLayout,
+        includesNonSelectable: Bool
+    ) -> [SelectableTextRegion] {
         var result: [SelectableTextRegion] = []
         if case let .beginning(beginning) = item,
            let beginningLayout = layout.beginningLayout
@@ -378,7 +458,7 @@ extension NativeTimelineCanvasView {
         for embed in layout.embedRegions {
             for (textIndex, textRegion) in
                 embed.textRegions.enumerated()
-            where textRegion.isSelectable {
+            where includesNonSelectable || textRegion.isSelectable {
                 var frame = textRegion.frame
                 frame.size.height +=
                     textRegion.text.layoutHeightAdjustment
@@ -399,7 +479,7 @@ extension NativeTimelineCanvasView {
         {
             for (textIndex, textRegion) in
                 component.textRegions.enumerated()
-            where textRegion.isSelectable {
+            where includesNonSelectable || textRegion.isSelectable {
                 var frame = textRegion.frame
                 frame.size.height +=
                     textRegion.text.layoutHeightAdjustment
@@ -574,6 +654,7 @@ extension NativeTimelineCanvasView {
         hoveredRow = nil
         hoveredCompactTimestampRow = nil
         setHoveredMention(nil)
+        setHoveredTextLink(nil)
         setHoveredTextSpoiler(nil)
         setHoveredCodeBlock(nil)
         setHoveredComponentButton(nil)
@@ -1055,6 +1136,7 @@ extension NativeTimelineCanvasView {
 
     func confirmDelete(_ message: Message) {
         guard let window, let actions else { return }
+        removeActionCapsule()
         let alert = NSAlert()
         alert.messageText = "Delete this message?"
         alert.informativeText = "This action cannot be undone."
@@ -1062,9 +1144,18 @@ extension NativeTimelineCanvasView {
         alert.addButton(withTitle: "Delete Message")
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
-        alert.beginSheetModal(for: window) { response in
-            guard response == .alertFirstButtonReturn else { return }
-            actions.delete(message)
+        // Do not order a sheet synchronously from a SwiftUI-hosted button
+        // transaction. AppKit can throw while remote media views are being
+        // reconciled during that same update group.
+        Task { @MainActor [weak self, weak window] in
+            await Task.yield()
+            guard let self, let window, self.window === window,
+                  window.attachedSheet == nil
+            else { return }
+            alert.beginSheetModal(for: window) { response in
+                guard response == .alertFirstButtonReturn else { return }
+                actions.delete(message)
+            }
         }
     }
 }

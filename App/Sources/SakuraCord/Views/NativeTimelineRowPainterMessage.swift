@@ -17,10 +17,12 @@ struct NativeTimelineMessageDrawInput {
     let isHovered: Bool
     let showsCompactTimestamp: Bool
     let hoveredMention: NativeTimelineMentionHover?
+    let hoveredTextLink: NativeTimelineTextLinkHover?
     let hoveredTextSpoiler: NativeTimelineTextSpoilerHover?
     let hoveredComponentButton: NativeTimelineComponentButtonTarget?
     let pressedComponentButton: NativeTimelineComponentButtonTarget?
     let componentButtonPressProgress: CGFloat
+    let isForwardedSourceHovered: Bool
     let hidesMessageContent: Bool
     let hoveredReactionID: String?
     let isAddReactionHovered: Bool
@@ -42,10 +44,12 @@ extension NativeTimelineRowPainter {
             let highlighted = input.highlighted
             let showsCompactTimestamp = input.showsCompactTimestamp
             let hoveredMention = input.hoveredMention
+            let hoveredTextLink = input.hoveredTextLink
             let hoveredTextSpoiler = input.hoveredTextSpoiler
             let hoveredComponentButton = input.hoveredComponentButton
             let pressedComponentButton = input.pressedComponentButton
             let componentButtonPressProgress = input.componentButtonPressProgress
+            let isForwardedSourceHovered = input.isForwardedSourceHovered
             let hidesMessageContent = input.hidesMessageContent
             let hoveredReactionID = input.hoveredReactionID
             let isAddReactionHovered = input.isAddReactionHovered
@@ -165,6 +169,29 @@ extension NativeTimelineRowPainter {
         if hidesMessageContent {
             return
         }
+        if let barFrame = layout.forwardedBarFrame {
+            NSColor.tertiaryLabelColor.withAlphaComponent(0.72).setFill()
+            NSBezierPath(
+                concentricRoundedRect: barFrame,
+                cornerRadius: barFrame.width / 2
+            ).fill()
+        }
+        if let headerFrame = layout.forwardedHeaderFrame {
+            let baseFont = NSFont.systemFont(
+                ofSize: NSFont.preferredFont(forTextStyle: .caption1).pointSize,
+                weight: .semibold
+            )
+            let italicFont = NSFont(
+                descriptor: baseFont.fontDescriptor.withSymbolicTraits(.italic),
+                size: baseFont.pointSize
+            ) ?? baseFont
+            text(
+                "↗ Forwarded",
+                in: headerFrame,
+                font: italicFont,
+                color: .secondaryLabelColor
+            )
+        }
         if let frame = layout.systemIconFrame {
             let currentUserID = model?.snapshot?.currentUser.id
             systemSymbol(
@@ -215,6 +242,11 @@ extension NativeTimelineRowPainter {
                     hoveredMention?.itemIdentifier == .message(message.id)
                         && hoveredMention?.region == .content
                     ? hoveredMention?.characterIndex
+                    : nil,
+                hoveredLinkCharacterIndex:
+                    hoveredTextLink?.itemIdentifier == .message(message.id)
+                        && hoveredTextLink?.region == .content
+                    ? hoveredTextLink?.characterIndex
                     : nil,
                 hoveredSpoilerRangeLocation:
                     hoveredTextSpoiler?.itemIdentifier
@@ -292,12 +324,11 @@ extension NativeTimelineRowPainter {
                 concentricRoundedRect: region.frame,
                 cornerRadius: 8
             ).fill()
-            let key = NativeTimelineMediaKey.media(
-                attachment.proxyURL ?? attachment.url
-            )
             switch attachment.mediaKind {
             case .image, .animatedImage:
-                if let image = mediaImage(for: key) {
+                if let key = NativeTimelineMediaKey.attachment(attachment),
+                   let image = mediaImage(for: key)
+                {
                     drawImage(
                         image,
                         in: region.frame,
@@ -374,6 +405,15 @@ extension NativeTimelineRowPainter {
                                 textIndex: textIndex
                             )
                         ? hoveredMention?.characterIndex
+                        : nil,
+                    hoveredLinkCharacterIndex:
+                        hoveredTextLink?.itemIdentifier
+                            == .message(message.id)
+                            && hoveredTextLink?.region == .embed(
+                                embedID: region.embedID,
+                                textIndex: textIndex
+                            )
+                        ? hoveredTextLink?.characterIndex
                         : nil,
                     hoveredSpoilerRangeLocation:
                         hoveredTextSpoiler?.itemIdentifier
@@ -471,6 +511,7 @@ extension NativeTimelineRowPainter {
                 layoutIndex: layoutIndex,
                 textSelection: textSelection,
                 hoveredMention: hoveredMention,
+                hoveredTextLink: hoveredTextLink,
                 hoveredTextSpoiler: hoveredTextSpoiler,
                 revealedTextSpoilerState:
                     revealedTextSpoilerState,
@@ -506,6 +547,46 @@ extension NativeTimelineRowPainter {
                     color: .secondaryLabelColor
                 )
             }
+        }
+        if let source = layout.forwardedSourceRegion {
+            if isForwardedSourceHovered {
+                NSColor.labelColor.withAlphaComponent(0.10).setFill()
+                NSBezierPath(
+                    concentricRoundedRect: source.frame,
+                    cornerRadius: source.frame.height / 2
+                ).fill()
+            }
+            let iconWidth: CGFloat = source.iconURL == nil ? 0 : 18
+            if iconWidth > 0 {
+                avatar(
+                    name: source.label,
+                    url: source.iconURL,
+                    in: CGRect(
+                        x: source.frame.minX + 6,
+                        y: source.frame.minY + 2,
+                        width: 18,
+                        height: 18
+                    )
+                )
+            }
+            let labelX = source.frame.minX + 6 + iconWidth + (iconWidth > 0 ? 6 : 0)
+            let dateText = source.timestamp.formatted(date: .abbreviated, time: .shortened)
+            let label = "\(source.label)  •  \(dateText)  ›"
+            text(
+                label,
+                in: CGRect(
+                    x: labelX,
+                    y: source.frame.minY,
+                    width: max(1, source.frame.maxX - labelX),
+                    height: source.frame.height
+                ),
+                font: .systemFont(
+                    ofSize: NSFont.preferredFont(forTextStyle: .caption1).pointSize,
+                    weight: .medium
+                ),
+                color: isForwardedSourceHovered ? .labelColor : .secondaryLabelColor,
+                lineBreakMode: .byTruncatingTail
+            )
         }
         if let frame = layout.threadFrame {
             if let thread = message.thread {

@@ -2,6 +2,87 @@ import AppKit
 import SakuraCordModels
 import SwiftUI
 
+@MainActor
+final class ChannelSidebarSelectionCommitter {
+    private enum PendingSelection: Equatable {
+        case none
+        case value(ChannelID?)
+    }
+
+    private var pendingTask: Task<Void, Never>?
+    private var pendingSelectionState = PendingSelection.none
+
+    var pendingSelection: ChannelID? {
+        guard case let .value(selection) = pendingSelectionState else {
+            return nil
+        }
+        return selection
+    }
+
+    var hasPendingSelection: Bool {
+        if case .value = pendingSelectionState {
+            return true
+        }
+        return false
+    }
+
+    func presentedSelection(fallback: ChannelID?) -> ChannelID? {
+        guard case let .value(selection) = pendingSelectionState else {
+            return fallback
+        }
+        return selection
+    }
+
+    func schedule(
+        _ selection: ChannelID?,
+        currentSelection: @escaping @MainActor () -> ChannelID?,
+        commit: @escaping @MainActor (ChannelID?) -> Void
+    ) {
+        pendingTask?.cancel()
+        let selectionBeforeDeferral = currentSelection()
+        let pendingSelection = PendingSelection.value(selection)
+        pendingSelectionState = pendingSelection
+        pendingTask = Task { @MainActor [weak self] in
+            // Let NSOutlineView finish its selection transaction before the
+            // model publishes the conversation-wide state change. Performing
+            // both operations reentrantly makes AppKit lay out the complete
+            // split view while its sidebar selection guard is still active.
+            await Task.yield()
+            guard let self,
+                  !Task.isCancelled,
+                  self.pendingSelectionState == pendingSelection
+            else { return }
+            guard currentSelection() == selectionBeforeDeferral else {
+                self.cancel()
+                return
+            }
+            commit(selection)
+        }
+    }
+
+    func selectedValueChanged(to selection: ChannelID?) {
+        guard case let .value(pendingSelection) = pendingSelectionState else {
+            return
+        }
+        if pendingSelection == selection {
+            pendingTask = nil
+            pendingSelectionState = .none
+        } else {
+            cancel()
+        }
+    }
+
+    func cancel() {
+        pendingTask?.cancel()
+        pendingTask = nil
+        pendingSelectionState = .none
+    }
+
+    deinit {
+        pendingTask?.cancel()
+    }
+}
+
 struct ChannelSidebarView: View {
     let voiceModel: AppModel
     let guild: Guild?
@@ -14,9 +95,10 @@ struct ChannelSidebarView: View {
     let isOfflineTesting: Bool
     let activeVoiceChannelID: ChannelID?
     let connectAccount: () -> Void
-    let logout: () async -> Void
     let updateStatus: (PresenceStatus) async -> Void
     @Environment(\.displayScale) private var displayScale
+    @State private var selectionCommitter =
+        ChannelSidebarSelectionCommitter()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,7 +118,10 @@ struct ChannelSidebarView: View {
                 .accessibilityHidden(guild != nil)
 
                 if guild != nil {
-                    List(selection: $selection) {
+                    let unreadCategoryIDs = guild.map {
+                        voiceModel.unreadCategoryIDs(guildID: $0.id)
+                    } ?? []
+                    List(selection: deferredGuildSelection) {
                         let groups = ChannelGroup.make(from: displayedChannels)
                         ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
                             ChannelGroupRows(
@@ -46,6 +131,10 @@ struct ChannelSidebarView: View {
                                 rulesChannelID: guild?.rulesChannelID,
                                 activeVoiceChannelID: activeVoiceChannelID,
                                 hiddenChannelIDs: hiddenChannelIDs,
+                                checkingChannelIDs: checkingChannelIDs,
+                                isUnread: group.categoryID.map(
+                                    unreadCategoryIDs.contains
+                                ) ?? false,
                                 voiceParticipantsByChannel: voiceSidebarParticipantsByChannel
                             )
                         }
@@ -53,6 +142,11 @@ struct ChannelSidebarView: View {
                     .listStyle(.sidebar)
                     .scrollContentBackground(.hidden)
                     .clipped()
+                    .onChange(of: selection) { _, newSelection in
+                        selectionCommitter.selectedValueChanged(
+                            to: newSelection
+                        )
+                    }
                 }
             }
 
@@ -64,7 +158,6 @@ struct ChannelSidebarView: View {
                 isAuthenticated: isAuthenticated,
                 isOfflineTesting: isOfflineTesting,
                 connectAccount: connectAccount,
-                logout: logout,
                 updateStatus: updateStatus
             )
         }
@@ -82,12 +175,44 @@ struct ChannelSidebarView: View {
         1 / max(displayScale, 1)
     }
 
+    private var deferredGuildSelection: Binding<ChannelID?> {
+        Binding(
+            // During the one-run-loop handoff, report the sidebar's accepted
+            // value back to NSOutlineView instead of the still-old model
+            // value. Otherwise AppKit sees the selection snap backward and
+            // performs a second complete selection/layout transaction when
+            // the model commit arrives.
+            get: {
+                selectionCommitter.presentedSelection(fallback: selection)
+            },
+            set: { newSelection in
+                guard selection != newSelection else { return }
+                if let newSelection {
+                    AppPerformanceSignposts.beginConversationNavigation(
+                        to: newSelection
+                    )
+                } else {
+                    AppPerformanceSignposts.cancelConversationNavigation()
+                }
+                selectionCommitter.schedule(
+                    newSelection,
+                    currentSelection: { selection },
+                    commit: { selection = $0 }
+                )
+            }
+        )
+    }
+
     private var hiddenChannelIDs: Set<ChannelID> {
-        []
+        voiceModel.hiddenChannelIDs
+    }
+
+    private var checkingChannelIDs: Set<ChannelID> {
+        voiceModel.checkingChannelIDs
     }
 
     private var displayedChannels: [Channel] {
-        channels.filter { voiceModel.conversationAccess(for: $0) != .hidden }
+        channels
     }
 
     private var directMessageChannels: [Channel] {
@@ -159,6 +284,8 @@ private struct VoiceSidebarParticipant: Identifiable {
 
 struct ChannelGroup: Identifiable {
     let id: String
+    let categoryID: ChannelID?
+    let guildID: GuildID?
     let name: String?
     let position: Int
     var channels: [Channel]
@@ -172,6 +299,8 @@ struct ChannelGroup: Identifiable {
             } else {
                 result.append(ChannelGroup(
                     id: groupID,
+                    categoryID: channel.categoryID,
+                    guildID: channel.guildID,
                     name: channel.category,
                     position: channel.categoryPosition,
                     channels: [channel]
@@ -205,7 +334,13 @@ struct ChannelGroup: Identifiable {
     }
 }
 
-private struct SidebarChromeSeparator: Shape {
+nonisolated enum ChannelCategoryPresentation {
+    static func initiallyExpanded(isCollapsedByDefault: Bool) -> Bool {
+        !isCollapsedByDefault
+    }
+}
+
+struct SidebarChromeSeparator: Shape {
     let cornerRadius: CGFloat
     let strokeInset: CGFloat
 
@@ -230,8 +365,10 @@ private struct ChannelGroupRows: View {
     let rulesChannelID: ChannelID?
     let activeVoiceChannelID: ChannelID?
     let hiddenChannelIDs: Set<ChannelID>
+    let checkingChannelIDs: Set<ChannelID>
+    let isUnread: Bool
     let voiceParticipantsByChannel: [ChannelID: [VoiceSidebarParticipant]]
-    @SceneStorage private var isExpanded: Bool
+    @State private var isExpanded: Bool
 
     init(
         model: AppModel,
@@ -240,6 +377,8 @@ private struct ChannelGroupRows: View {
         rulesChannelID: ChannelID?,
         activeVoiceChannelID: ChannelID?,
         hiddenChannelIDs: Set<ChannelID>,
+        checkingChannelIDs: Set<ChannelID>,
+        isUnread: Bool,
         voiceParticipantsByChannel: [ChannelID: [VoiceSidebarParticipant]]
     ) {
         self.model = model
@@ -248,8 +387,19 @@ private struct ChannelGroupRows: View {
         self.rulesChannelID = rulesChannelID
         self.activeVoiceChannelID = activeVoiceChannelID
         self.hiddenChannelIDs = hiddenChannelIDs
+        self.checkingChannelIDs = checkingChannelIDs
+        self.isUnread = isUnread
         self.voiceParticipantsByChannel = voiceParticipantsByChannel
-        _isExpanded = SceneStorage(wrappedValue: true, "dev.sakuracord.channel-category.\(group.id).expanded")
+        let isCollapsed = group.categoryID.flatMap { categoryID in
+            group.guildID.map {
+                model.isCategoryCollapsed(guildID: $0, categoryID: categoryID)
+            }
+        } ?? false
+        _isExpanded = State(
+            initialValue: ChannelCategoryPresentation.initiallyExpanded(
+                isCollapsedByDefault: isCollapsed
+            )
+        )
     }
 
     var body: some View {
@@ -262,7 +412,8 @@ private struct ChannelGroupRows: View {
                             channel: channel,
                             rulesChannelID: rulesChannelID,
                             isVoiceConnected: activeVoiceChannelID == channel.id,
-                            isHidden: hiddenChannelIDs.contains(channel.id)
+                            isHidden: hiddenChannelIDs.contains(channel.id),
+                            isChecking: checkingChannelIDs.contains(channel.id)
                         )
                         .tag(channel.id)
                         ForEach(voiceParticipantsByChannel[channel.id] ?? []) { participant in
@@ -273,7 +424,8 @@ private struct ChannelGroupRows: View {
                             model: model,
                             channel: channel,
                             rulesChannelID: rulesChannelID,
-                            isHidden: hiddenChannelIDs.contains(channel.id)
+                            isHidden: hiddenChannelIDs.contains(channel.id),
+                            isChecking: checkingChannelIDs.contains(channel.id)
                         )
                         .tag(channel.id)
                     }
@@ -287,9 +439,26 @@ private struct ChannelGroupRows: View {
                         .accessibilityHidden(true)
                 }
 
-                if let name = group.name {
+                if let name = group.name,
+                   let categoryID = group.categoryID,
+                   let guildID = group.guildID
+                {
                     Button {
-                        withAnimation(.snappy(duration: 0.18)) { isExpanded.toggle() }
+                        let previousValue = isExpanded
+                        let nextValue = !isExpanded
+                        withAnimation(.snappy(duration: 0.18)) {
+                            isExpanded = nextValue
+                        }
+                        model.setCategoryCollapsed(
+                            !nextValue,
+                            guildID: guildID,
+                            categoryID: categoryID
+                        ) { accepted in
+                            guard !accepted else { return }
+                            withAnimation(.snappy(duration: 0.18)) {
+                                isExpanded = previousValue
+                            }
+                        }
                     } label: {
                         HStack(spacing: 5) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -302,9 +471,83 @@ private struct ChannelGroupRows: View {
                     }
                     .buttonStyle(.plain)
                     .help(isExpanded ? "Collapse \(name)" : "Expand \(name)")
+                    .disabled(
+                        model.isChannelNotificationMutationPending(categoryID)
+                    )
+                    .overlay {
+                        ChannelContextMenuBridge(
+                            subject: .category,
+                            isSelected: false,
+                            isUnread: isUnread,
+                            isMutationPending:
+                                model.isChannelNotificationMutationPending(
+                                    categoryID
+                                ),
+                            directOverride: model.categoryNotificationOverride(
+                                guildID: guildID,
+                                categoryID: categoryID
+                            ),
+                            inheritedLevel:
+                                model.inheritedCategoryNotificationLevel(
+                                    guildID: guildID
+                                ),
+                            inheritanceSource: .server,
+                            markRead: {
+                                model.markCategoryRead(
+                                    categoryID: categoryID,
+                                    guildID: guildID
+                                )
+                            },
+                            mute: { duration in
+                                model.setCategoryMute(
+                                    true,
+                                    until: duration.endDate(),
+                                    guildID: guildID,
+                                    categoryID: categoryID
+                                )
+                            },
+                            unmute: {
+                                model.setCategoryMute(
+                                    false,
+                                    until: nil,
+                                    guildID: guildID,
+                                    categoryID: categoryID
+                                )
+                            },
+                            setNotificationLevel: { level in
+                                model.setCategoryNotificationLevel(
+                                    level,
+                                    guildID: guildID,
+                                    categoryID: categoryID
+                                )
+                            },
+                            copyChannelID: {
+                                ChannelContextMenuValue.copy(
+                                    categoryID.description
+                                )
+                            },
+                            copyLink: {}
+                        )
+                    }
                 }
             }
         }
+        .onChange(of: shouldCollapseFromServer) { _, shouldCollapse in
+            guard shouldCollapse, isExpanded else { return }
+            withAnimation(.snappy(duration: 0.18)) {
+                isExpanded = false
+            }
+        }
+    }
+
+    private var shouldCollapseFromServer: Bool {
+        guard let categoryID = group.categoryID,
+              let guildID = group.guildID
+        else { return false }
+        return model.isCategoryCollapsed(
+            guildID: guildID,
+            categoryID: categoryID
+        )
     }
 }
 
@@ -356,9 +599,7 @@ private struct AccountControlView: View {
     let isAuthenticated: Bool
     let isOfflineTesting: Bool
     let connectAccount: () -> Void
-    let logout: () async -> Void
     let updateStatus: (PresenceStatus) async -> Void
-    @State private var confirmLogout = false
 
     var body: some View {
         GlassEffectContainer(spacing: 0) {
@@ -379,8 +620,12 @@ private struct AccountControlView: View {
                         isAuthenticated: isAuthenticated,
                         isOfflineTesting: isOfflineTesting,
                         currentStatus: currentStatus,
-                        connectAccount: connectAccount,
-                        requestLogout: { confirmLogout = true },
+                        savedAccounts: voiceModel.savedAccounts,
+                        activeAccountID: voiceModel.activeAccountID,
+                        manageAccounts: connectAccount,
+                        switchAccount: { accountID in
+                            await voiceModel.switchAccount(to: accountID)
+                        },
                         updateStatus: updateStatus
                     )
                 }
@@ -402,19 +647,15 @@ private struct AccountControlView: View {
         .padding(.horizontal, 8)
         .padding(.top, 8)
         .padding(.bottom, 12)
-        .confirmationDialog("Log out of Discord?", isPresented: $confirmLogout) {
-            Button("Log Out", role: .destructive) { Task { await logout() } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("SakuraCord will remove this account's saved session from Keychain.")
-        }
     }
 
     private var displayName: String {
         if isOfflineTesting {
             return "Offline Testing"
         }
-        return isAuthenticated ? (user?.displayName ?? "Discord Account") : "Connect Account"
+        return isAuthenticated
+            ? (user?.displayName ?? "Discord Account")
+            : "Connect Account"
     }
 
     private var accountSubtitle: String {
@@ -448,44 +689,33 @@ private struct AccountMenu: View {
     let isAuthenticated: Bool
     let isOfflineTesting: Bool
     let currentStatus: PresenceStatus
-    let connectAccount: () -> Void
-    let requestLogout: () -> Void
+    let savedAccounts: [SavedAccount]
+    let activeAccountID: String?
+    let manageAccounts: () -> Void
+    let switchAccount: (String) async -> Bool
     let updateStatus: (PresenceStatus) async -> Void
 
+    @Environment(\.openSettings) private var openSettings
+
     var body: some View {
-        Menu {
-            if isOfflineTesting {
-                Text("Discord networking is disabled")
-            } else if isAuthenticated {
-                Menu("Set Status", systemImage: "circle.dotted") {
-                    ForEach(PresenceStatus.allCases.filter { $0 != .offline }, id: \.self) { status in
-                        Button {
-                            Task { await updateStatus(status) }
-                        } label: {
-                            if status == currentStatus {
-                                Label(status.label, systemImage: "checkmark")
-                            } else {
-                                Text(status.label)
-                            }
-                        }
-                    }
-                }
-                Button("Switch Account…", systemImage: "person.2", action: connectAccount)
-                Divider()
-                Button("Log Out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive, action: requestLogout)
-            } else {
-                Button("Connect Discord Account…", systemImage: "person.crop.circle.badge.plus", action: connectAccount)
-            }
-            Divider()
-            SettingsLink { Label("Settings…", systemImage: "gearshape") }
-        } label: {
+        ZStack {
             Image(systemName: "gearshape.fill")
                 .font(.body)
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
+                .foregroundStyle(.secondary)
+                .allowsHitTesting(false)
+            NativeAccountMenuButton(
+                isAuthenticated: isAuthenticated,
+                isOfflineTesting: isOfflineTesting,
+                currentStatus: currentStatus,
+                savedAccounts: savedAccounts,
+                activeAccountID: activeAccountID,
+                manageAccounts: manageAccounts,
+                switchAccount: switchAccount,
+                updateStatus: updateStatus,
+                openSettings: { openSettings() }
+            )
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .frame(width: 28, height: 28)
         .help("Account and Settings")
     }
 }
@@ -517,17 +747,18 @@ private struct ChannelRow: View {
     var rulesChannelID: ChannelID?
     var isVoiceConnected = false
     var isHidden = false
+    var isChecking = false
 
     var body: some View {
         HStack(spacing: 8) {
             Capsule()
                 .fill(Color.white)
                 .frame(width: 4, height: 8)
-                .opacity(channel.unreadCount > 0 ? 1 : 0)
+                .opacity(showsUnread ? 1 : 0)
                 .frame(width: 8)
             Image(systemName: systemImage)
                 .fontWeight(
-                    channel.unreadCount > 0 && !isMuted
+                    showsUnread && !isMuted
                         ? .medium
                         : .regular
                 )
@@ -538,7 +769,7 @@ private struct ChannelRow: View {
                 .frame(width: 16)
             Text(channel.name)
                 .fontWeight(
-                    channel.unreadCount > 0 && !isMuted
+                    showsUnread && !isMuted
                         ? .medium
                         : .regular
                 )
@@ -550,12 +781,12 @@ private struct ChannelRow: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             }
-            if channel.kind == .forum, channel.unreadCount > 0 {
+            if channel.kind == .forum, showsUnread {
                 Text("\(channel.unreadCount) New")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Color(hex: 0x5865F2))
             }
-            if channel.mentionCount > 0 {
+            if !isChecking, channel.mentionCount > 0 {
                 Text(channel.mentionCount, format: .number)
                     .font(.caption2.bold())
                     .foregroundStyle(.white)
@@ -572,6 +803,7 @@ private struct ChannelRow: View {
                 isUnread: model.isChannelUnread(channel.id),
                 isMutationPending:
                     model.isChannelNotificationMutationPending(channel.id),
+                allowsMutations: !isChecking,
                 directOverride: model.channelNotificationOverride(for: channel),
                 inheritedLevel:
                     model.inheritedChannelNotificationLevel(for: channel),
@@ -609,7 +841,8 @@ private struct ChannelRow: View {
     }
 
     private var systemImage: String {
-        ChannelIconPresentation.systemImage(
+        if isChecking { return "lock.fill" }
+        return ChannelIconPresentation.systemImage(
             for: channel,
             isHidden: isHidden,
             rulesChannelID: rulesChannelID
@@ -620,11 +853,15 @@ private struct ChannelRow: View {
         model.isChannelMuted(channel)
     }
 
+    private var showsUnread: Bool {
+        !isChecking && channel.unreadCount > 0
+    }
+
     private var channelIconForegroundStyle: Color {
         if isMuted {
             return .primary.opacity(0.32)
         }
-        return channel.unreadCount > 0
+        return showsUnread
             ? .primary
             : .primary.opacity(0.66)
     }
@@ -633,12 +870,13 @@ private struct ChannelRow: View {
         if isMuted {
             return .primary.opacity(0.35)
         }
-        return channel.unreadCount > 0
+        return showsUnread
             ? .primary
             : .primary.opacity(0.78)
     }
 
     private var accessibilityValue: String {
+        if isChecking { return "Checking access" }
         var values: [String] = []
         if channel.kind == .forum, channel.unreadCount > 0 {
             values.append(

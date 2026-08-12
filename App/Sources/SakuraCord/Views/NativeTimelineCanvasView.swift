@@ -123,12 +123,15 @@ final class NativeTimelineCanvasView: NSView {
         let frame: CGRect
     }
 
-    static let bitmapCostLimit = 24 * 1024 * 1024
+    static let bitmapCostLimit =
+        NativeTimelineMediaMemoryPolicy.rowBitmapBytes
+    static let prewarmRowLimit = 8
     var storage = NativeTimelineCanvasStorage()
     var baseContentOriginY: CGFloat = 0
     var contentOriginY: CGFloat = 0
     var historySkeleton:
         TimelineHistorySkeletonPresentation?
+    var historySkeletonShimmerTask: Task<Void, Never>?
     var minimumHeight: CGFloat = 1
     var bottomSpacerHeight: CGFloat = 0
     var maximumDrawDuration = 0.0
@@ -155,6 +158,7 @@ final class NativeTimelineCanvasView: NSView {
     var contentHeight: CGFloat { storage.contentHeight }
 
     var model: AppModel?
+    var presentedConversationID: ChannelID?
     var actions: NativeTimelineRowActions?
     var onWidthChange: ((CGFloat) -> Void)?
     var usesViewportSizedBacking = false
@@ -222,15 +226,11 @@ final class NativeTimelineCanvasView: NSView {
         [NativeTimelineComponentRevealKey:
             NativeTimelineSpoilerOverlayPresentation] = [:]
     var animatedMediaReconcileTask: Task<Void, Never>?
-    var animatedMediaScrollReconcileTask: Task<Void, Never>?
     var mediaInvalidationTask: Task<Void, Never>?
     var pendingMediaInvalidations:
         Set<NativeMessageTimelineItem.Identifier> = []
-    let mediaViewerState = NativeTimelineMediaViewerState()
     lazy var mediaViewerHost = NSHostingView(
-        rootView: AnyView(
-            NativeTimelineMediaViewerLayer(state: mediaViewerState)
-        )
+        rootView: AnyView(Color.clear.frame(width: 0, height: 0))
     )
 
     override var isFlipped: Bool { true }
@@ -269,6 +269,25 @@ final class NativeTimelineCanvasView: NSView {
         addSubview(reactionPickerSource)
         mediaViewerHost.frame = .zero
         addSubview(mediaViewerHost)
+        let notificationCenter = NotificationCenter.default
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(mediaPlaybackVisibilityDidChange(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(mediaPlaybackVisibilityDidChange(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(mediaPlaybackVisibilityDidChange(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
     }
 
     @available(*, unavailable)
@@ -283,12 +302,20 @@ final class NativeTimelineCanvasView: NSView {
 
     deinit {
         MainActor.assumeIsolated {
+            NotificationCenter.default.removeObserver(self)
             mediaInvalidationTask?.cancel()
+            historySkeletonShimmerTask?.cancel()
             cancelReactionPreviewLoads()
+            NativeTimelineMediaStore.shared.removeStaticRequests(
+                owner: visibleMediaPinOwner
+            )
             NativeTimelineMediaStore.shared.releaseVisibleImages(
                 owner: visibleMediaPinOwner
             )
             NativeTimelineMediaStore.shared.releasePinnedImages(
+                owner: visibleMediaPinOwner
+            )
+            NativeTimelineMediaStore.shared.cancelAnimatedRequests(
                 owner: visibleMediaPinOwner
             )
             if let spoilerRevealObserverID {
@@ -324,12 +351,14 @@ enum NativeTimelineRowPainter {
         isHovered: Bool,
         showsCompactTimestamp: Bool = false,
         hoveredMention: NativeTimelineMentionHover? = nil,
+        hoveredTextLink: NativeTimelineTextLinkHover? = nil,
         hoveredTextSpoiler: NativeTimelineTextSpoilerHover? = nil,
         hoveredComponentButton:
             NativeTimelineComponentButtonTarget? = nil,
         pressedComponentButton:
             NativeTimelineComponentButtonTarget? = nil,
         componentButtonPressProgress: CGFloat = 0,
+        isForwardedSourceHovered: Bool = false,
         hidesMessageContent: Bool = false,
         hoveredReactionID: String? = nil,
         isAddReactionHovered: Bool = false,
@@ -406,11 +435,13 @@ enum NativeTimelineRowPainter {
                 isHovered: isHovered,
                 showsCompactTimestamp: showsCompactTimestamp,
                 hoveredMention: hoveredMention,
+                hoveredTextLink: hoveredTextLink,
                 hoveredTextSpoiler: hoveredTextSpoiler,
                 hoveredComponentButton: hoveredComponentButton,
                 pressedComponentButton: pressedComponentButton,
                 componentButtonPressProgress:
                     componentButtonPressProgress,
+                isForwardedSourceHovered: isForwardedSourceHovered,
                 hidesMessageContent: hidesMessageContent,
                 hoveredReactionID: hoveredReactionID,
                 isAddReactionHovered: isAddReactionHovered,

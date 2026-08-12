@@ -1,10 +1,29 @@
 import Foundation
 import SakuraCordModels
 
+public struct PartialBulkReadAcknowledgementError: Error, Sendable {
+    public let acceptedReadStates: [BulkReadStateAcknowledgement]
+    public let failureDescription: String
+
+    public init(
+        acceptedReadStates: [BulkReadStateAcknowledgement],
+        failureDescription: String
+    ) {
+        self.acceptedReadStates = acceptedReadStates
+        self.failureDescription = failureDescription
+    }
+}
+
 public protocol ChatProvider: Sendable {
+    func prepareAuthentication() async throws
     func bootstrap() async throws -> BootstrapSnapshot
     func channels(in guildID: GuildID?) async throws -> [Channel]
     func members(in guildID: GuildID?) async throws -> [Member]
+    func updateMemberListViewport(
+        in guildID: GuildID,
+        channelID: ChannelID,
+        visibleRange: ClosedRange<Int>
+    ) async throws
     func resolveMembers(in guildID: GuildID, userIDs: [UserID]) async throws -> [Member]
     func searchMembers(in guildID: GuildID, query: String, limit: Int) async throws -> [Member]
     func roles(in guildID: GuildID) async throws -> [GuildRole]
@@ -33,9 +52,11 @@ public protocol ChatProvider: Sendable {
         until: Date?
     ) async throws
     func sendTyping(in channelID: ChannelID) async throws
+    func ensurePrivateChannel(for userID: UserID) async throws -> Channel
     func send(_ draft: SendMessageDraft) async throws -> Message
     func send(_ draft: SendMessageDraft, progress: @escaping @Sendable (MessageSendProgress) -> Void)
         async throws -> Message
+    func forward(_ draft: ForwardMessageDraft) async throws -> Message
     func supports(_ capability: ChatCapability) async -> Bool
     func applicationCommandCatalog(for target: ApplicationCommandIndexTarget) async throws
         -> ApplicationCommandCatalog
@@ -52,6 +73,10 @@ public protocol ChatProvider: Sendable {
     ) async throws -> [ComponentSelectOption]
     func searchGIFs(query: String) async throws -> [GIFSearchResult]
     func trendingGIFs() async throws -> [GIFSearchResult]
+    func gifPickerLanding() async throws -> GIFPickerLanding
+    func favoriteGIFs() async throws -> [GIFSearchResult]
+    func setGIFFavorite(_ gif: GIFSearchResult, isFavorite: Bool) async throws
+        -> [GIFSearchResult]
     func stickers(in guildID: GuildID) async throws -> [MessageSticker]
     func edit(messageID: MessageID, channelID: ChannelID, content: String) async throws -> Message
     func delete(messageID: MessageID, channelID: ChannelID) async throws
@@ -69,6 +94,16 @@ public protocol ChatProvider: Sendable {
         flags: UInt64?,
         lastViewed: Int?
     ) async throws -> ReadAcknowledgementResponse
+    func acknowledgeBulk(_ readStates: [BulkReadStateAcknowledgement]) async throws
+    func updateGuildNotificationLevel(
+        guildID: GuildID,
+        level: MessageNotificationLevel
+    ) async throws
+    func updateGuildMute(
+        guildID: GuildID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws
     func updateChannelNotificationLevel(
         guildID: GuildID?,
         channelID: ChannelID,
@@ -79,6 +114,22 @@ public protocol ChatProvider: Sendable {
         channelID: ChannelID,
         isMuted: Bool,
         until: Date?
+    ) async throws
+    func updateCategoryNotificationLevel(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        level: MessageNotificationLevel
+    ) async throws
+    func updateCategoryMute(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws
+    func updateCategoryCollapsed(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isCollapsed: Bool
     ) async throws
     func toggleReaction(_ emoji: String, messageID: MessageID, channelID: ChannelID) async throws
     func setReaction(
@@ -110,11 +161,30 @@ public protocol ChatProvider: Sendable {
     func privateCallIsRingable(channelID: ChannelID) async throws -> Bool
     func ringPrivateCall(channelID: ChannelID, recipients: [UserID]?) async throws
     func stopRingingPrivateCall(channelID: ChannelID, recipients: [UserID]) async throws
+    func updateClientAppState(isFocused: Bool) async
     func eventStream() async -> AsyncStream<ClientEvent>
     func disconnect() async
 }
 
+public protocol PendingCredentialChatProvider: ChatProvider {
+    func persistPendingCredential(
+        to store: any CredentialStore,
+        accountID: String
+    ) async throws -> CredentialHandle
+    func discardPendingCredential() async
+}
+
 public extension ChatProvider {
+    func prepareAuthentication() async throws {}
+
+    func updateClientAppState(isFocused: Bool) async {}
+
+    func updateMemberListViewport(
+        in guildID: GuildID,
+        channelID: ChannelID,
+        visibleRange: ClosedRange<Int>
+    ) async throws {}
+
     func resolveMembers(in guildID: GuildID, userIDs: [UserID]) async throws -> [Member] {
         let requested = Set(userIDs.prefix(100))
         return try await members(in: guildID).filter { requested.contains($0.id) }
@@ -151,6 +221,14 @@ public extension ChatProvider {
         let message = try await send(draft)
         progress(.completed(messageID: message.id))
         return message
+    }
+
+    func forward(_ draft: ForwardMessageDraft) async throws -> Message {
+        throw ChatProviderError.capabilityDisabled(.messageForwarding)
+    }
+
+    func ensurePrivateChannel(for userID: UserID) async throws -> Channel {
+        throw ChatProviderError.channelNotFound
     }
 
     func supports(_ capability: ChatCapability) async -> Bool {
@@ -198,6 +276,20 @@ public extension ChatProvider {
         throw ChatProviderError.capabilityDisabled(.gifs)
     }
 
+    func gifPickerLanding() async throws -> GIFPickerLanding {
+        throw ChatProviderError.capabilityDisabled(.gifs)
+    }
+
+    func favoriteGIFs() async throws -> [GIFSearchResult] {
+        throw ChatProviderError.capabilityDisabled(.gifs)
+    }
+
+    func setGIFFavorite(_ gif: GIFSearchResult, isFavorite: Bool) async throws
+        -> [GIFSearchResult]
+    {
+        throw ChatProviderError.capabilityDisabled(.gifs)
+    }
+
     func stickers(in guildID: GuildID) async throws -> [MessageSticker] {
         throw ChatProviderError.capabilityDisabled(.stickers)
     }
@@ -238,11 +330,43 @@ public extension ChatProvider {
         level: MessageNotificationLevel
     ) async throws {}
 
+    func acknowledgeBulk(_ readStates: [BulkReadStateAcknowledgement]) async throws {}
+
+    func updateGuildNotificationLevel(
+        guildID: GuildID,
+        level: MessageNotificationLevel
+    ) async throws {}
+
+    func updateGuildMute(
+        guildID: GuildID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {}
+
     func updateChannelMute(
         guildID: GuildID?,
         channelID: ChannelID,
         isMuted: Bool,
         until: Date?
+    ) async throws {}
+
+    func updateCategoryNotificationLevel(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        level: MessageNotificationLevel
+    ) async throws {}
+
+    func updateCategoryMute(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {}
+
+    func updateCategoryCollapsed(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isCollapsed: Bool
     ) async throws {}
 
     func forumPosts(in channelID: ChannelID, query: ForumPostQuery) async throws -> ForumPostPage {
@@ -388,6 +512,7 @@ public enum ChatCapability: String, Codable, CaseIterable, Hashable, Sendable {
     case gifs
     case stickers
     case stickerSending
+    case messageForwarding
 
     public var displayName: String {
         switch self {
@@ -399,6 +524,7 @@ public enum ChatCapability: String, Codable, CaseIterable, Hashable, Sendable {
         case .gifs: "GIF search"
         case .stickers: "Guild stickers"
         case .stickerSending: "Sticker sending"
+        case .messageForwarding: "Message forwarding"
         }
     }
 }

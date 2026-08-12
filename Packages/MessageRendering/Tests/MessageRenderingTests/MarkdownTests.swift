@@ -61,6 +61,91 @@ import Testing
     )
 }
 
+@Test func `bare URLs keep markdown delimiters inside one intact link`() throws {
+    let urlText =
+        "https://docs.google.com/document/d/abc_def__ghi/edit?tab=t.0#heading=h.foo_bar"
+    let source = "Open \(urlText) to review it"
+    let expectedURL = try #require(URL(string: urlText))
+
+    let swiftUIValue = DiscordMarkdown.attributed(source)
+    #expect(String(swiftUIValue.characters) == source)
+
+    let appKitValue = DiscordMarkdown.appKitAttributed(source)
+    #expect(appKitValue.string == source)
+    let linkRange = (appKitValue.string as NSString).range(of: urlText)
+    #expect(linkRange.length == (urlText as NSString).length)
+    var effectiveLinkRange = NSRange(location: 0, length: 0)
+    #expect(
+        appKitValue.attribute(
+            .link,
+            at: linkRange.location,
+            longestEffectiveRange: &effectiveLinkRange,
+            in: linkRange
+        ) as? URL == expectedURL
+    )
+    #expect(NSEqualRanges(effectiveLinkRange, linkRange))
+    #expect(
+        appKitValue.attribute(
+            .link,
+            at: NSMaxRange(linkRange) - 1,
+            effectiveRange: nil
+        ) as? URL == expectedURL
+    )
+
+    let firstUnderscore = (appKitValue.string as NSString).range(of: "_")
+    let font = try #require(
+        appKitValue.attribute(
+            .font,
+            at: firstUnderscore.location,
+            effectiveRange: nil
+        ) as? NSFont
+    )
+    #expect(!font.fontDescriptor.symbolicTraits.contains(.italic))
+    #expect(
+        appKitValue.attribute(
+            .underlineStyle,
+            at: linkRange.location,
+            effectiveRange: nil
+        ) == nil
+    )
+}
+
+@Test func `bare URLs exclude sentence punctuation and keep balanced parentheses`() throws {
+    let first = "https://example.com/docs"
+    let second = "https://en.wikipedia.org/wiki/Function_(mathematics)"
+    let source = "Read \(first), then \(second)."
+    let value = DiscordMarkdown.appKitAttributed(source)
+
+    #expect(value.string == source)
+    let string = value.string as NSString
+    for expected in [first, second] {
+        let range = string.range(of: expected)
+        #expect(range.location != NSNotFound)
+        #expect(
+            value.attribute(.link, at: range.location, effectiveRange: nil)
+                as? URL == URL(string: expected)
+        )
+        #expect(
+            value.attribute(
+                .link,
+                at: NSMaxRange(range) - 1,
+                effectiveRange: nil
+            ) as? URL == URL(string: expected)
+        )
+    }
+    let comma = string.range(of: ",").location
+    let period = string.range(of: ".", options: .backwards).location
+    #expect(value.attribute(.link, at: comma, effectiveRange: nil) == nil)
+    #expect(value.attribute(.link, at: period, effectiveRange: nil) == nil)
+}
+
+@Test func `bare URL rendering rejects a scheme without a host`() {
+    let value = DiscordMarkdown.appKitAttributed("broken https:// remains plain")
+
+    #expect(value.string == "broken https:// remains plain")
+    #expect(value.attribute(.link, at: 7, effectiveRange: nil) == nil)
+}
+
 @Test func `message link policy permits web links and classifies Discord channels`() throws {
     let webURL = try #require(URL(string: "https://example.com/docs"))
     let channelURL = try #require(

@@ -14,6 +14,22 @@ struct SakuraCordApp: App {
     private let performanceMockProvider: MockChatProvider?
 
     init() {
+        AppPerformanceSignposts.beginStartup()
+        ComposerPromisedFileStorage.removeAbandonedFilesAtStartup()
+        let savesDiagnosticsToDisk = UserDefaults.standard.bool(
+            forKey: "saveAPIDiagnosticsToDisk"
+        )
+        if savesDiagnosticsToDisk {
+            do {
+                try DiscordAPIDiagnosticStore.shared
+                    .setSavesDiagnosticsToDisk(true)
+            } catch {
+                UserDefaults.standard.set(
+                    false,
+                    forKey: "saveAPIDiagnosticsToDisk"
+                )
+            }
+        }
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)
         opensForumPerformanceFixture = configuration.includesForumPerformanceFixture
         opensChatPerformanceFixture = configuration.includesChatPerformanceFixture
@@ -48,9 +64,14 @@ struct SakuraCordApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("SakuraCord", id: "main") {
+        // SakuraCord owns one account workspace. A WindowGroup would restore
+        // every previously opened main window on the next launch.
+        Window("SakuraCord", id: "main") {
             RootView(model: model)
                 .frame(minWidth: 860, minHeight: 560)
+                .onAppear {
+                    AppPerformanceSignposts.reportRootViewAppeared()
+                }
                 .task {
                     await model.start()
                     if opensChatPerformanceFixture {
@@ -105,6 +126,7 @@ struct SakuraCordApp: App {
                     }
                 }
         }
+        .defaultLaunchBehavior(.presented)
         .defaultSize(width: 1280, height: 780)
         .windowBackgroundDragBehavior(.disabled)
         .commands {

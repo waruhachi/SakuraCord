@@ -4,6 +4,20 @@ import SakuraCordModels
 import SwiftUI
 import Testing
 
+@Test func `skeleton shimmer phase wraps without changing layout`() {
+    let start = Date(timeIntervalSinceReferenceDate: 0)
+    let midpoint = Date(
+        timeIntervalSinceReferenceDate: SkeletonShimmerStyle.duration / 2
+    )
+    let wrapped = Date(
+        timeIntervalSinceReferenceDate: SkeletonShimmerStyle.duration
+    )
+
+    #expect(SkeletonShimmerStyle.phase(at: start) == 0)
+    #expect(abs(SkeletonShimmerStyle.phase(at: midpoint) - 0.5) < 0.000_001)
+    #expect(abs(SkeletonShimmerStyle.phase(at: wrapped)) < 0.000_001)
+}
+
 @MainActor
 @Test func `shared conversation skeleton is only visible without presentable messages`() {
     #expect(MessageTimelineLoadingPolicy.showsInitialPlaceholder(isLoading: true, messageCount: 0))
@@ -187,10 +201,25 @@ private final class MessageTimelineSkeletonSafeAreaHost<Content: View>:
     )
 }
 
-@Test func `unresolved unread history requires a user scroll before loading one older page`() {
+@Test func `underfilled unread history loads without user scroll intent`() {
+    #expect(
+        TimelineEarlierHistoryLoadingPolicy.shouldLoad(
+            isNearTop: true,
+            contentFitsViewport: true,
+            allowsAutomaticLoading: true,
+            hasMoreMessages: true,
+            isLoading: false,
+            hasUnresolvedUnreadBoundary: true,
+            hasUserScrollIntent: false
+        )
+    )
+}
+
+@Test func `filled unresolved unread history requires user scroll intent before loading`() {
     #expect(
         !TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: true,
+            contentFitsViewport: false,
             allowsAutomaticLoading: true,
             hasMoreMessages: true,
             isLoading: false,
@@ -201,6 +230,7 @@ private final class MessageTimelineSkeletonSafeAreaHost<Content: View>:
     #expect(
         TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: true,
+            contentFitsViewport: false,
             allowsAutomaticLoading: true,
             hasMoreMessages: true,
             isLoading: false,
@@ -211,6 +241,7 @@ private final class MessageTimelineSkeletonSafeAreaHost<Content: View>:
     #expect(
         TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: true,
+            contentFitsViewport: false,
             allowsAutomaticLoading: true,
             hasMoreMessages: true,
             isLoading: false,
@@ -221,11 +252,36 @@ private final class MessageTimelineSkeletonSafeAreaHost<Content: View>:
     #expect(
         !TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: true,
+            contentFitsViewport: true,
             allowsAutomaticLoading: true,
             hasMoreMessages: true,
             isLoading: true,
             hasUnresolvedUnreadBoundary: true,
             hasUserScrollIntent: true
+        )
+    )
+}
+
+@Test func `earlier history intent survives an active gesture or requested skeleton viewport`() {
+    #expect(
+        TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+            hasIntent: true,
+            isGestureActive: true,
+            isInProvisionalHistory: false
+        )
+    )
+    #expect(
+        TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+            hasIntent: true,
+            isGestureActive: false,
+            isInProvisionalHistory: true
+        )
+    )
+    #expect(
+        !TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+            hasIntent: true,
+            isGestureActive: false,
+            isInProvisionalHistory: false
         )
     )
 }

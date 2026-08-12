@@ -142,11 +142,12 @@ nonisolated enum NativeTimelineCompactTimestampHitTesting {
     static func contains(
         _ point: CGPoint,
         rowOrigin: CGFloat,
-        frame: CGRect?
+        highlightFrame: CGRect?
     ) -> Bool {
-        frame?
-            .offsetBy(dx: 0, dy: rowOrigin)
-            .contains(point) == true
+        NativeTimelineHoverHitTesting.contains(
+            CGPoint(x: point.x, y: point.y - rowOrigin),
+            in: highlightFrame
+        )
     }
 }
 
@@ -183,6 +184,7 @@ nonisolated enum NativeTimelineMessageMenuAction: Equatable {
     case retrySending
     case addReaction
     case reply
+    case forward
     case markUnread
     case editMessage
     case copyText
@@ -205,7 +207,8 @@ nonisolated enum NativeTimelineMessageMenuPolicy {
     static func entries(
         canEdit: Bool,
         canRetry: Bool,
-        canReply: Bool
+        canReply: Bool,
+        canForward: Bool = false
     ) -> [NativeTimelineMessageMenuEntry] {
         var result: [NativeTimelineMessageMenuEntry] = []
         if canRetry {
@@ -226,6 +229,13 @@ nonisolated enum NativeTimelineMessageMenuPolicy {
                 .reply,
                 title: "Reply",
                 systemImage: "arrowshape.turn.up.left"
+            ))
+        }
+        if canForward {
+            result.append(.action(
+                .forward,
+                title: "Forward",
+                systemImage: "arrowshape.turn.up.right"
             ))
         }
         if canEdit {
@@ -618,6 +628,12 @@ nonisolated struct NativeTimelineMentionHover: Equatable {
     let rawToken: String
 }
 
+nonisolated struct NativeTimelineTextLinkHover: Equatable {
+    let itemIdentifier: NativeMessageTimelineItem.Identifier
+    let region: NativeTimelineTextRegion
+    let characterIndex: Int
+}
+
 nonisolated struct NativeTimelineTextSpoilerHover: Equatable {
     let itemIdentifier: NativeMessageTimelineItem.Identifier
     let region: NativeTimelineTextRegion
@@ -711,6 +727,7 @@ nonisolated enum NativeTimelinePointerActivationTarget: Hashable {
     case authorProfile(MessageID)
     case invocationProfile(MessageID)
     case reply(MessageID, MessageID)
+    case forwardedSource(MessageID, ChannelID, GuildID?, MessageID?)
     case linkedImage(MessageID, URL)
     case attachment(MessageID, String)
     case embedMedia(MessageID, String)
@@ -1126,7 +1143,8 @@ final class NativeTimelineLottieStickerOverlay: NSView {
             progressIndicator.isHidden = false
             progressIndicator.startAnimation(nil)
             loadingTask = Task { @MainActor [weak self] in
-                let animation = await LottieAnimation.loadedFrom(url: url)
+                let animation = await SharedTimelineLottieAnimationLoader
+                    .shared.animation(for: url)
                 guard !Task.isCancelled,
                       let self,
                       self.url == url
@@ -1170,6 +1188,116 @@ final class NativeTimelineLottieStickerOverlay: NSView {
     }
 }
 
+nonisolated enum TimelineLottieLoadingPolicy {
+    static let maximumCachedAnimations = 12
+    static let maximumConcurrentParses = 1
+}
+
+actor SharedTimelineLottieAnimationLoader {
+    static let shared = SharedTimelineLottieAnimationLoader()
+
+    typealias DataLoader = @Sendable (URL) async throws -> Data
+
+    private let cache: DefaultAnimationCache = {
+        let cache = DefaultAnimationCache()
+        cache.cacheSize = TimelineLottieLoadingPolicy.maximumCachedAnimations
+        return cache
+    }()
+    private var inFlight: [URL: Task<LottieAnimation?, Never>] = [:]
+    private var isParsing = false
+    private struct ParseWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+
+    private var parseWaiters: [ParseWaiter] = []
+    private let loadData: DataLoader
+
+    init(
+        loadData: @escaping DataLoader = { url in
+            try await SharedMediaDataLoader.shared.data(
+                for: url,
+                priority: .visible
+            )
+        }
+    ) {
+        self.loadData = loadData
+    }
+
+    func animation(for url: URL) async -> LottieAnimation? {
+        if let cached = cache.animation(forKey: url.absoluteString) {
+            return cached
+        }
+        if let task = inFlight[url] {
+            return await task.value
+        }
+        let task = Task<LottieAnimation?, Never> { [weak self] in
+            guard let self else { return nil }
+            let data = try? await self.loadData(url)
+            guard let data, !Task.isCancelled,
+                  await self.acquireParseLane()
+            else { return nil }
+            guard !Task.isCancelled else {
+                await self.releaseParseLane()
+                return nil
+            }
+            let animation = try? LottieAnimation.from(data: data)
+            if let animation {
+                self.cache.setAnimation(
+                    animation,
+                    forKey: url.absoluteString
+                )
+            }
+            await self.releaseParseLane()
+            return animation
+        }
+        inFlight[url] = task
+        let animation = await task.value
+        inFlight[url] = nil
+        return animation
+    }
+
+    private func acquireParseLane() async -> Bool {
+        if Task.isCancelled {
+            return false
+        }
+        if !isParsing {
+            isParsing = true
+            return true
+        }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                parseWaiters.append(
+                    ParseWaiter(
+                        id: waiterID,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task {
+                await self.cancelParseWaiter(waiterID)
+            }
+        }
+    }
+
+    private func cancelParseWaiter(_ id: UUID) {
+        guard let index = parseWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        parseWaiters.remove(at: index).continuation.resume(returning: false)
+    }
+
+    private func releaseParseLane() {
+        if !parseWaiters.isEmpty {
+            parseWaiters.removeFirst().continuation.resume(returning: true)
+        } else {
+            isParsing = false
+        }
+    }
+}
+
 struct NativeTimelineSpoilerOverlayPresentation: Hashable {
     let cornerRadius: CGFloat
 }
@@ -1196,6 +1324,22 @@ nonisolated enum NativeTimelineSpoilerAppearance {
             x: bounds.midX - width / 2,
             y: bounds.midY - height / 2,
             width: width,
+            height: height
+        )
+    }
+
+    static func labelFrame(
+        in bounds: CGRect,
+        measuredLabelHeight: CGFloat
+    ) -> CGRect {
+        let height = min(
+            max(1, bounds.height),
+            ceil(measuredLabelHeight)
+        )
+        return CGRect(
+            x: bounds.minX,
+            y: bounds.midY - height / 2,
+            width: bounds.width,
             height: height
         )
     }
@@ -1253,12 +1397,15 @@ final class NativeTimelineSpoilerOverlayHost: NSView {
         pillView.setAccessibilityElement(false)
         addSubview(pillView)
 
+        let labelParagraphStyle = NSMutableParagraphStyle()
+        labelParagraphStyle.alignment = .center
         pillLabel.attributedStringValue = NSAttributedString(
             string: "SPOILER",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 11, weight: .bold),
                 .foregroundColor: NSColor.white,
                 .kern: 0.4,
+                .paragraphStyle: labelParagraphStyle,
             ]
         )
         pillLabel.alignment = .center
@@ -1286,7 +1433,10 @@ final class NativeTimelineSpoilerOverlayHost: NSView {
             in: bounds,
             measuredLabelWidth: labelSize.width
         )
-        pillLabel.frame = pillView.bounds
+        pillLabel.frame = NativeTimelineSpoilerAppearance.labelFrame(
+            in: pillView.bounds,
+            measuredLabelHeight: labelSize.height
+        )
     }
 
     override func updateTrackingAreas() {
@@ -1490,6 +1640,10 @@ final class NativeTimelineAnimatedMediaOverlay: NSView {
         } else {
             selectionView.isHidden = true
         }
+    }
+
+    func setPlaybackSuppressed(_ isSuppressed: Bool) {
+        imageView.setPlaybackSuppressed(isSuppressed)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }

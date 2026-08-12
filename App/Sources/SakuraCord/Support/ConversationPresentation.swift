@@ -10,16 +10,26 @@ nonisolated enum ConversationAccess: Equatable {
         if case let .readable(canSend) = self { return canSend }
         return false
     }
+
+    var isReadable: Bool {
+        if case .readable = self { return true }
+        return false
+    }
 }
 
 nonisolated enum DiscordPermissionBits {
     static let administrator: UInt64 = 1 << 3
     static let viewChannel: UInt64 = 1 << 10
     static let sendMessages: UInt64 = 1 << 11
+    static let embedLinks: UInt64 = 1 << 14
+    static let attachFiles: UInt64 = 1 << 15
     static let readMessageHistory: UInt64 = 1 << 16
     static let connect: UInt64 = 1 << 20
     static let manageThreads: UInt64 = 1 << 34
+    static let useExternalStickers: UInt64 = 1 << 37
     static let sendMessagesInThreads: UInt64 = 1 << 38
+    static let sendVoiceMessages: UInt64 = 1 << 46
+    static let bypassSlowmode: UInt64 = 1 << 52
 }
 
 nonisolated enum ChannelIconPresentation {
@@ -51,6 +61,19 @@ nonisolated enum ChannelIconPresentation {
         case .groupDirectMessage: "person.2.fill"
         case .unknown: "questionmark"
         }
+    }
+
+    static func systemImage(
+        for channel: Channel,
+        access: ConversationAccess,
+        rulesChannelID: ChannelID?
+    ) -> String {
+        if access == .checking { return "lock.fill" }
+        return systemImage(
+            for: channel,
+            isHidden: access == .hidden,
+            rulesChannelID: rulesChannelID
+        )
     }
 
     static let forumPostSystemImage = "bubble.left.fill"
@@ -126,16 +149,33 @@ nonisolated enum ConversationPermissionResolver {
         roles: [GuildRole],
         currentRoleIDs: Set<RoleID>? = nil
     ) -> UInt64? {
-        if guild.isOwnedByCurrentUser == true { return .max }
-
         let roleIDs = currentRoleIDs ?? Set(currentMember?.roles.map(\.id) ?? [])
         let hasCurrentRoleIdentity = currentRoleIDs != nil || currentMember != nil
-        let basePermissions = guild.currentUserPermissions ?? basePermissions(
+        let resolvedBasePermissions = guild.currentUserPermissions ?? basePermissions(
             guildID: guild.id,
             roleIDs: roleIDs,
             roles: roles
         )
-        guard let permissions = basePermissions else { return nil }
+        return effectivePermissions(
+            guild: guild,
+            channel: channel,
+            currentUserID: currentUserID,
+            resolvedBasePermissions: resolvedBasePermissions,
+            roleIDs: roleIDs,
+            hasCurrentRoleIdentity: hasCurrentRoleIdentity
+        )
+    }
+
+    static func effectivePermissions(
+        guild: Guild,
+        channel: Channel,
+        currentUserID: UserID,
+        resolvedBasePermissions: UInt64?,
+        roleIDs: Set<RoleID>,
+        hasCurrentRoleIdentity: Bool
+    ) -> UInt64? {
+        if guild.isOwnedByCurrentUser == true { return .max }
+        guard let permissions = resolvedBasePermissions else { return nil }
         if permissions & DiscordPermissionBits.administrator != 0 { return .max }
 
         guard let overwrites = channel.permissionOverwrites, !overwrites.isEmpty else {
@@ -250,7 +290,7 @@ nonisolated enum ConversationPermissionResolver {
         return .readable(canSend: canSend)
     }
 
-    private static func basePermissions(
+    static func basePermissions(
         guildID: GuildID,
         roleIDs: Set<RoleID>,
         roles: [GuildRole]

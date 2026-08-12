@@ -34,18 +34,22 @@ final class NativeTimelinePointerState {
         let row: Int?
         let compactTimestampRow: Int?
         let mention: NativeTimelineMentionHover?
+        let textLink: NativeTimelineTextLinkHover?
         let textSpoiler: NativeTimelineTextSpoilerHover?
         let codeBlock: NativeTimelineCodeBlockPointerTarget?
         let componentButton: NativeTimelineComponentButtonTarget?
+        let forwardedSourceMessageID: MessageID?
     }
 
     var hoveredRow: Int?
     var hoveredCompactTimestampRow: Int?
     var hoveredMention: NativeTimelineMentionHover?
+    var hoveredTextLink: NativeTimelineTextLinkHover?
     var hoveredTextSpoiler: NativeTimelineTextSpoilerHover?
     var hoveredCodeBlock: NativeTimelineCodeBlockPointerTarget?
     var pressedCodeBlockCopyButton: NativeTimelineCodeBlockPointerTarget?
     var hoveredComponentButton: NativeTimelineComponentButtonTarget?
+    var hoveredForwardedSourceMessageID: MessageID?
     var pressedComponentButton: NativeTimelineComponentButtonTarget?
     var visualPressedComponentButton: NativeTimelineComponentButtonTarget?
     var componentButtonPressProgress: CGFloat = 0
@@ -54,6 +58,7 @@ final class NativeTimelinePointerState {
     var pressedActivationTarget: NativeTimelinePointerActivationTarget?
     var hoveredReaction: NativeTimelineReactionPointerTarget?
     var suppressesHoverPresentation = false
+    var overlayBlocksInteractions = false
     var textSelection: NativeTimelineTextSelection?
     var textSelectionGesture: NativeTimelineTextSelectionGesture?
     var didDragTextSelection = false
@@ -68,18 +73,22 @@ final class NativeTimelinePointerState {
             row: hoveredRow,
             compactTimestampRow: hoveredCompactTimestampRow,
             mention: hoveredMention,
+            textLink: hoveredTextLink,
             textSpoiler: hoveredTextSpoiler,
             codeBlock: hoveredCodeBlock,
             componentButton:
-                visualPressedComponentButton ?? hoveredComponentButton
+                visualPressedComponentButton ?? hoveredComponentButton,
+            forwardedSourceMessageID: hoveredForwardedSourceMessageID
         )
         hoveredRow = nil
         hoveredCompactTimestampRow = nil
         hoveredMention = nil
+        hoveredTextLink = nil
         hoveredTextSpoiler = nil
         hoveredCodeBlock = nil
         pressedCodeBlockCopyButton = nil
         hoveredComponentButton = nil
+        hoveredForwardedSourceMessageID = nil
         pressedComponentButton = nil
         visualPressedComponentButton = nil
         componentButtonPressProgress = 0
@@ -117,10 +126,12 @@ final class NativeTimelinePointerState {
         hoveredRow != nil
             || hoveredCompactTimestampRow != nil
             || hoveredMention != nil
+            || hoveredTextLink != nil
             || hoveredTextSpoiler != nil
             || hoveredCodeBlock != nil
             || pressedCodeBlockCopyButton != nil
             || hoveredComponentButton != nil
+            || hoveredForwardedSourceMessageID != nil
             || pressedComponentButton != nil
             || visualPressedComponentButton != nil
             || componentButtonPressProgress != 0
@@ -243,6 +254,11 @@ extension NativeTimelineCanvasView {
         set { pointer.hoveredMention = newValue }
     }
 
+    var hoveredTextLink: NativeTimelineTextLinkHover? {
+        get { pointer.hoveredTextLink }
+        set { pointer.hoveredTextLink = newValue }
+    }
+
     var hoveredTextSpoiler: NativeTimelineTextSpoilerHover? {
         get { pointer.hoveredTextSpoiler }
         set { pointer.hoveredTextSpoiler = newValue }
@@ -261,6 +277,11 @@ extension NativeTimelineCanvasView {
     var hoveredComponentButton: NativeTimelineComponentButtonTarget? {
         get { pointer.hoveredComponentButton }
         set { pointer.hoveredComponentButton = newValue }
+    }
+
+    var hoveredForwardedSourceMessageID: MessageID? {
+        get { pointer.hoveredForwardedSourceMessageID }
+        set { pointer.hoveredForwardedSourceMessageID = newValue }
     }
 
     var pressedComponentButton: NativeTimelineComponentButtonTarget? {
@@ -301,6 +322,11 @@ extension NativeTimelineCanvasView {
     var suppressesHoverPresentation: Bool {
         get { pointer.suppressesHoverPresentation }
         set { pointer.suppressesHoverPresentation = newValue }
+    }
+
+    var overlayBlocksInteractions: Bool {
+        get { pointer.overlayBlocksInteractions }
+        set { pointer.overlayBlocksInteractions = newValue }
     }
 
     var textSelection: NativeTimelineTextSelection? {

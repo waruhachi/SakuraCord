@@ -292,9 +292,11 @@ struct MessageActionCapsule: View {
     let message: Message
     let canEdit: Bool
     @Binding var isReactionPickerPresented: Bool
+    @Binding var isDeleteConfirmationPresented: Bool
     let retry: (() -> Void)?
     let edit: () -> Void
     let reply: (() -> Void)?
+    let forward: (() -> Void)?
     let react: (String) -> Void
     let copy: () -> Void
     let copyLink: () -> Void
@@ -302,6 +304,14 @@ struct MessageActionCapsule: View {
     let delete: () -> Void
 
     var body: some View {
+        if isDeleteConfirmationPresented {
+            deleteConfirmation
+        } else {
+            actions
+        }
+    }
+
+    private var actions: some View {
         HoverActionPill {
             if let retry {
                 HoverActionButton(
@@ -320,6 +330,13 @@ struct MessageActionCapsule: View {
             if let reply {
                 HoverActionButton(systemImage: "arrowshape.turn.up.left", help: "Reply", action: reply)
             }
+            if let forward {
+                HoverActionButton(
+                    systemImage: "arrowshape.turn.up.right",
+                    help: "Forward",
+                    action: forward
+                )
+            }
             if canEdit {
                 HoverActionButton(systemImage: "pencil", help: "Edit message", action: edit)
             }
@@ -332,8 +349,34 @@ struct MessageActionCapsule: View {
             }
             if canEdit {
                 HoverActionButton(
-                    systemImage: "trash", help: "Delete message", role: .destructive, action: delete
-                )
+                    systemImage: "trash",
+                    help: "Delete message",
+                    role: .destructive
+                ) {
+                    isDeleteConfirmationPresented = true
+                }
+            }
+        }
+    }
+
+    private var deleteConfirmation: some View {
+        HoverActionPill {
+            Text("Delete message?")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 4)
+            HoverActionButton(
+                systemImage: "xmark",
+                help: "Cancel deletion"
+            ) {
+                isDeleteConfirmationPresented = false
+            }
+            HoverActionButton(
+                systemImage: "trash.fill",
+                help: "Delete message",
+                role: .destructive
+            ) {
+                isDeleteConfirmationPresented = false
+                delete()
             }
         }
     }
@@ -693,11 +736,13 @@ private struct InlineEditKeycap: View {
 struct MessageProfilePopoverContent: View {
     let model: AppModel
     let userID: UserID
+    let requestID: UUID
 
     var body: some View {
         Group {
             if let presentation = model.contextualProfilePresentation,
-               presentation.member.id == userID
+               presentation.member.id == userID,
+               presentation.requestID == requestID
             {
                 ProfilePresentationContent(presentation: presentation)
             } else {
@@ -705,7 +750,7 @@ struct MessageProfilePopoverContent: View {
             }
         }
         .onDisappear {
-            model.dismissContextualProfile(for: userID)
+            model.dismissContextualProfile(requestID: requestID)
         }
     }
 }

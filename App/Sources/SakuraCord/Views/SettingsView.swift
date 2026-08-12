@@ -13,10 +13,13 @@ struct SettingsView: View {
     @AppStorage("voiceCameraUID") private var cameraUID = ""
     @AppStorage("voiceInputVolume") private var inputVolume = 1.0
     @AppStorage("voiceOutputVolume") private var outputVolume = 1.0
+    @AppStorage("saveAPIDiagnosticsToDisk") private var savesAPIDiagnosticsToDisk = false
     @State private var mediaDevices: MediaDeviceSnapshot = .empty
     @State private var notificationPermission = "Checking…"
     @State private var apiDiagnosticEntryCount = 0
     @State private var apiDiagnosticStatus: String?
+    @State private var capturesDetailedAPIPayloads =
+        DiscordAPIDiagnosticStore.shared.capturesPayloadDetails
 
     var body: some View {
         @Bindable var notificationPreferences = model.notificationPreferences
@@ -202,6 +205,23 @@ struct SettingsView: View {
 
             Form {
                 Section("Discord API logs") {
+                    Toggle(
+                        "Capture detailed sanitized payloads",
+                        isOn: $capturesDetailedAPIPayloads
+                    )
+                    .onChange(of: capturesDetailedAPIPayloads) { _, captures in
+                        DiscordAPIDiagnosticStore.shared.capturesPayloadDetails =
+                            captures
+                    }
+
+                    Toggle(
+                        "Save diagnostics to disk",
+                        isOn: $savesAPIDiagnosticsToDisk
+                    )
+                    .onChange(of: savesAPIDiagnosticsToDisk) { _, savesToDisk in
+                        updateDiskLogging(savesToDisk)
+                    }
+
                     LabeledContent("Retained entries") {
                         Text(apiDiagnosticEntryCount.formatted())
                             .monospacedDigit()
@@ -209,8 +229,10 @@ struct SettingsView: View {
 
                     Text(
                         "Exports retained Discord REST, attachment, authentication, and Gateway request/response metadata from this app session. "
+                            + "Detailed sanitized payload capture is off by default because processing large responses increases CPU and energy use. "
                             + "Message text, names, usernames, profile text, credentials, cookies, challenge data, filenames, and URLs are discarded before logging. "
-                            + "Message, user, channel, and server IDs may be included."
+                            + "IDs, nonces, request IDs, and rate-limit bucket IDs are always redacted. "
+                            + "Disk capture is off by default and keeps at most four private JSON Lines session files of up to 64 MiB each in Application Support/SakuraCord/Diagnostics."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -220,9 +242,7 @@ struct SettingsView: View {
                             Task { await exportAPILogs() }
                         }
                         Button("Clear Logs", role: .destructive) {
-                            DiscordAPIDiagnosticStore.shared.clear()
-                            apiDiagnosticEntryCount = 0
-                            apiDiagnosticStatus = "The retained API log was cleared."
+                            clearAPILogs()
                         }
                     }
 
@@ -256,6 +276,43 @@ struct SettingsView: View {
     private func refreshAPIDiagnosticCount() {
         apiDiagnosticEntryCount =
             DiscordAPIDiagnosticStore.shared.retainedEntryCount
+    }
+
+    private func clearAPILogs() {
+        let store = DiscordAPIDiagnosticStore.shared
+        let wasSavingToDisk = store.savesDiagnosticsToDisk
+        do {
+            try store.clearMemoryAndDisk()
+            apiDiagnosticEntryCount = 0
+            if wasSavingToDisk, let fileURL = store.currentDiskLogURL {
+                apiDiagnosticStatus =
+                    "Retained and saved API logs were cleared. Saving continues to \(fileURL.lastPathComponent)."
+            } else {
+                apiDiagnosticStatus = "Retained and saved API logs were cleared."
+            }
+        } catch {
+            savesAPIDiagnosticsToDisk = store.savesDiagnosticsToDisk
+            apiDiagnosticStatus =
+                "Could not clear every saved API log: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateDiskLogging(_ savesToDisk: Bool) {
+        do {
+            try DiscordAPIDiagnosticStore.shared
+                .setSavesDiagnosticsToDisk(savesToDisk)
+            if savesToDisk,
+               let fileURL = DiscordAPIDiagnosticStore.shared.currentDiskLogURL
+            {
+                apiDiagnosticStatus = "Saving diagnostics to \(fileURL.lastPathComponent)"
+            } else {
+                apiDiagnosticStatus = "Diagnostics are no longer being saved to disk."
+            }
+        } catch {
+            savesAPIDiagnosticsToDisk = false
+            apiDiagnosticStatus =
+                "Could not save diagnostics to disk: \(error.localizedDescription)"
+        }
     }
 
     private func exportAPILogs() async {

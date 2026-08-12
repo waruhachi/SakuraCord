@@ -10,7 +10,8 @@ struct MessageTimelineView: View {
         .runsChatPerformanceAutoScroll
     @State private var scrollPolicy = MessageTimelineScrollPolicy()
     @State private var allowsAutomaticHistoryLoading = false
-    @State private var hasUserRequestedEarlierHistory = false
+    @State private var hasEarlierHistoryScrollIntent = false
+    @State private var isEarlierHistoryScrollGestureActive = false
     @State private var highlightedMessageID: MessageID?
     @State private var hasEstablishedInitialPosition = false
     @State private var scrollRequest: MessageTimelineScrollRequest?
@@ -39,6 +40,9 @@ struct MessageTimelineView: View {
                     messageCount: model.messages.count,
                     isLoadingEarlierPage: model.isLoadingEarlier
                 ),
+            earlierHistoryLoadFailed:
+                model.messageLoadErrorIsEarlierPage
+                    && model.messageLoadError != nil,
             bottomContentInset: bottomContentInset,
             unreadMessageID: exactUnreadBoundaryMessageID,
             highlightedMessageID: highlightedMessageID,
@@ -68,7 +72,9 @@ struct MessageTimelineView: View {
                 isLoading: model.isLoadingMessages,
                 messageCount: model.messages.count
             ) {
-                MessageTimelineLoadingSkeleton()
+                MessageTimelineLoadingSkeleton(
+                    bottomContentInset: bottomContentInset
+                )
             }
         }
         .overlay(alignment: .top) {
@@ -126,7 +132,8 @@ struct MessageTimelineView: View {
                 )
             }
             hasEstablishedInitialPosition = false
-            hasUserRequestedEarlierHistory = false
+            hasEarlierHistoryScrollIntent = false
+            isEarlierHistoryScrollGestureActive = false
             scrollPolicy.didBeginChannel()
             latestScrollState = TimelineScrollState(
                 isNearTop: false,
@@ -154,7 +161,8 @@ struct MessageTimelineView: View {
         }
         .task(id: model.selectedChannelID) {
             allowsAutomaticHistoryLoading = false
-            hasUserRequestedEarlierHistory = false
+            hasEarlierHistoryScrollIntent = false
+            isEarlierHistoryScrollGestureActive = false
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
             allowsAutomaticHistoryLoading = true
@@ -169,6 +177,7 @@ struct MessageTimelineView: View {
             }
         }
         .onExitCommand {
+            guard !model.consumeEscapeForMediaViewer() else { return }
             if let conversationID {
                 model.completeConversationReadingAndAdvance(
                     channelID: conversationID
@@ -287,6 +296,15 @@ struct MessageTimelineView: View {
 
     private func handleScrollState(_ value: TimelineScrollState) {
         latestScrollState = value
+        let retainedHistoryIntent =
+            TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+                hasIntent: hasEarlierHistoryScrollIntent,
+                isGestureActive: isEarlierHistoryScrollGestureActive,
+                isInProvisionalHistory: value.isInProvisionalHistory
+            )
+        if hasEarlierHistoryScrollIntent != retainedHistoryIntent {
+            hasEarlierHistoryScrollIntent = retainedHistoryIntent
+        }
         if scrollPolicy.isNearBottom != value.isNearBottom {
             scrollPolicy.updateGeometry(isNearBottom: value.isNearBottom)
         }
@@ -312,23 +330,28 @@ struct MessageTimelineView: View {
     private func loadEarlierIfNeeded(for state: TimelineScrollState) {
         guard TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: state.isNearTop,
+            contentFitsViewport: state.contentFitsViewport,
             allowsAutomaticLoading: allowsAutomaticHistoryLoading,
             hasMoreMessages: model.hasMoreMessages,
             isLoading: model.isLoadingEarlier,
             hasUnresolvedUnreadBoundary:
                 hasUnresolvedInitialUnreadBoundary,
             hasUserScrollIntent:
-                hasUserRequestedEarlierHistory
+                hasEarlierHistoryScrollIntent
         )
         else { return }
-        hasUserRequestedEarlierHistory = false
         loadEarlier()
     }
 
     private func handleUserScrollBegan() {
         scrollPolicy.userScrollBegan()
+        isEarlierHistoryScrollGestureActive = true
         if hasUnresolvedInitialUnreadBoundary {
-            hasUserRequestedEarlierHistory = true
+            // Keep the intent for the complete live gesture. A fast upward
+            // scroll can consume more than one bounded history page before
+            // AppKit sends didEndLiveScroll; clearing it after the first page
+            // strands the viewport against a still-provisional boundary.
+            hasEarlierHistoryScrollIntent = true
         }
         if let channelID = model.selectedChannelID {
             model.reportTimelineUserInteraction(channelID: channelID)
@@ -336,7 +359,15 @@ struct MessageTimelineView: View {
     }
 
     private func handleUserScrollEnded(_ value: TimelineScrollState) {
+        isEarlierHistoryScrollGestureActive = false
+        hasEarlierHistoryScrollIntent =
+            TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+                hasIntent: hasEarlierHistoryScrollIntent,
+                isGestureActive: false,
+                isInProvisionalHistory: value.isInProvisionalHistory
+            )
         scrollPolicy.userScrollEnded(isNearBottom: value.isNearBottom)
+        loadEarlierIfNeeded(for: value)
     }
 }
 
@@ -415,7 +446,7 @@ struct UnreadMessagesBanner: View {
         let count = summary.loadedUnreadCount.formatted()
         let noun = summary.loadedUnreadCount == 1 ? "message" : "messages"
         if summary.isLowerBound {
-            return "\(count)+ new \(noun) in loaded history"
+            return "\(count)+ new \(noun)"
         }
         let time = summary.firstUnreadTimestamp.formatted(
             date: .omitted,
@@ -431,13 +462,15 @@ nonisolated struct TimelineScrollState: Equatable, Sendable {
     let contentFitsViewport: Bool
     let hasEstablishedInitialPosition: Bool
     let hasReachedNewestMessageBoundary: Bool
+    let isInProvisionalHistory: Bool
 
     init(
         isNearTop: Bool,
         isNearBottom: Bool,
         contentFitsViewport: Bool = false,
         hasEstablishedInitialPosition: Bool = false,
-        hasReachedNewestMessageBoundary: Bool = false
+        hasReachedNewestMessageBoundary: Bool = false,
+        isInProvisionalHistory: Bool = false
     ) {
         self.isNearTop = isNearTop
         self.isNearBottom = isNearBottom
@@ -446,6 +479,7 @@ nonisolated struct TimelineScrollState: Equatable, Sendable {
             hasEstablishedInitialPosition
         self.hasReachedNewestMessageBoundary =
             hasReachedNewestMessageBoundary
+        self.isInProvisionalHistory = isInProvisionalHistory
     }
 
 }
@@ -519,6 +553,8 @@ nonisolated enum TimelineUnreadBoundaryPolicy {
 }
 
 struct MessageTimelineLoadingSkeleton: View {
+    var bottomContentInset: CGFloat = 0
+
     private static let patterns = [
         MessageTimelineSkeletonRow(id: 0, firstLineWidth: 132, secondLineWidth: 330),
         MessageTimelineSkeletonRow(id: 1, firstLineWidth: 94, secondLineWidth: 470),
@@ -529,21 +565,34 @@ struct MessageTimelineLoadingSkeleton: View {
     ]
 
     var body: some View {
-        ZStack {
-            Color(nsColor: .windowBackgroundColor)
-            GeometryReader { geometry in
-                VStack(alignment: .leading, spacing: 20) {
-                    ForEach(0 ..< MessageTimelineSkeletonLayout.rowCount(for: geometry.size.height), id: \.self) { index in
-                        MessageTimelineSkeletonMessage(
-                            row: Self.patterns[index % Self.patterns.count],
-                            availableLineWidth: max(120, geometry.size.width - 84)
-                        )
+        SkeletonShimmerTimeline {
+            ZStack {
+                Color(nsColor: .windowBackgroundColor)
+                GeometryReader { geometry in
+                    VStack(alignment: .leading, spacing: 20) {
+                        ForEach(
+                            0 ..< MessageTimelineSkeletonLayout.rowCount(
+                                for: max(0, geometry.size.height - bottomContentInset)
+                            ),
+                            id: \.self
+                        ) { index in
+                            MessageTimelineSkeletonMessage(
+                                row: Self.patterns[index % Self.patterns.count],
+                                availableLineWidth: max(120, geometry.size.width - 84)
+                            )
+                        }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 18)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 0,
+                        maxHeight: max(0, geometry.size.height - bottomContentInset),
+                        alignment: .topLeading
+                    )
+                    .clipped()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 18)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .clipped()
             }
         }
         // The timeline itself extends through the top scroll-edge safe area so
@@ -639,6 +688,7 @@ private struct MessageTimelineSkeletonMessage: View {
             Circle()
                 .fill(.secondary.opacity(0.16))
                 .frame(width: 40, height: 40)
+                .skeletonShimmer()
 
             VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 8) {
@@ -662,6 +712,7 @@ private struct MessageTimelineSkeletonMessage: View {
         Capsule()
             .fill(.secondary.opacity(0.16))
             .frame(width: width, height: height)
+            .skeletonShimmer()
     }
 }
 

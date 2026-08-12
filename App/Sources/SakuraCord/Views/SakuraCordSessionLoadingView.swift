@@ -1,90 +1,309 @@
 import AppKit
 import SwiftUI
 
+nonisolated enum SessionLoadingSkeletonLayout {
+    enum ChannelPlaceholder: Hashable, Sendable {
+        case category(Int)
+        case channel(section: Int, row: Int)
+
+        var height: CGFloat {
+            switch self {
+            case .category: 28
+            case .channel: 32
+            }
+        }
+    }
+
+    static let serverCount = 11
+    static let channelSectionCounts = [3, 4, 4, 4]
+
+    static func channelPlaceholdersFitting(height: CGFloat) -> [ChannelPlaceholder] {
+        let availableHeight = max(0, height - ChatChromeMetrics.channelListTopPadding)
+        var result: [ChannelPlaceholder] = []
+        var usedHeight: CGFloat = 0
+
+        for (section, rowCount) in channelSectionCounts.enumerated() {
+            if section > 0 {
+                let category = ChannelPlaceholder.category(section)
+                let firstChannelHeight = ChannelPlaceholder
+                    .channel(section: section, row: 0)
+                    .height
+                guard usedHeight + category.height + firstChannelHeight <= availableHeight
+                else { break }
+                result.append(category)
+                usedHeight += category.height
+            }
+
+            for row in 0 ..< rowCount {
+                let channel = ChannelPlaceholder.channel(section: section, row: row)
+                guard usedHeight + channel.height <= availableHeight else {
+                    return result
+                }
+                result.append(channel)
+                usedHeight += channel.height
+            }
+        }
+        return result
+    }
+}
+
+struct ChannelListLoadingSkeleton: View {
+    var body: some View {
+        GeometryReader { geometry in
+            let placeholders = SessionLoadingSkeletonLayout
+                .channelPlaceholdersFitting(height: geometry.size.height)
+
+            VStack(spacing: 0) {
+                ForEach(placeholders, id: \.self) { placeholder in
+                    switch placeholder {
+                    case .category:
+                        categoryRow
+                            .frame(height: placeholder.height)
+                    case .channel:
+                        channelRow
+                            .frame(height: placeholder.height)
+                    }
+                }
+            }
+            .padding(.top, ChatChromeMetrics.channelListTopPadding)
+            .frame(
+                width: geometry.size.width,
+                height: geometry.size.height,
+                alignment: .topLeading
+            )
+            .clipped()
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var categoryRow: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.12))
+                .frame(width: 8)
+            SkeletonShape(cornerRadius: 4)
+                .frame(width: 86, height: 9)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+    }
+
+    private var channelRow: some View {
+        HStack(spacing: 8) {
+            Color.clear
+                .frame(width: 8, height: 8)
+            SkeletonShape(cornerRadius: 4)
+                .frame(width: 16, height: 16)
+            SkeletonShape(cornerRadius: 5.5)
+                .frame(width: 112, height: 11)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+    }
+}
+
+/// A data-free representation of the complete chat chrome. Startup owns a
+/// standalone navigation container; account switching overlays these same
+/// placeholders inside the already-mounted workspace navigation container.
 struct SakuraCordSessionLoadingView: View {
     let state: AppModel.SessionState
     let isOfflineTesting: Bool
+    var isAccountSwitch = false
+    var isEmbeddedInWorkspace = false
+    var embeddedSidebarWidth = ChatChromeMetrics.serverRailWidth + 230
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var appeared = false
-    @State private var animationStart = Date()
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
-        GeometryReader { geometry in
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { timeline in
-                let elapsed = reduceMotion ? 0 : timeline.date.timeIntervalSince(animationStart)
-
-                ZStack {
-                    SakuraCordAuroraBackdrop(elapsed: elapsed)
-                    SakuraCordSakuraPetalField(elapsed: elapsed, size: geometry.size)
-                        .accessibilityHidden(true)
-
-                    loadingHero(elapsed: elapsed)
-                        .padding(48)
-                        .scaleEffect(appeared ? 1 : 0.94)
-                        .opacity(appeared ? 1 : 0)
-
-                    windowDragRegion
-                }
+        SkeletonShimmerTimeline {
+            if isEmbeddedInWorkspace {
+                embeddedChrome
+            } else {
+                sessionChrome
             }
         }
-        .ignoresSafeArea()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .preferredColorScheme(.dark)
-        .toolbar(removing: .title)
-        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
-        .onAppear {
-            animationStart = Date()
-            guard !reduceMotion else {
-                appeared = true
-                return
-            }
-            withAnimation(.spring(duration: 0.9, bounce: 0.22)) {
-                appeared = true
-            }
-        }
-    }
-
-    private func loadingHero(elapsed: TimeInterval) -> some View {
-        VStack(spacing: 0) {
-            ZStack {
-                Image(nsImage: NSApplication.shared.applicationIconImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .frame(width: 112, height: 112)
-                    .offset(y: reduceMotion ? 0 : sin(elapsed * 1.25) * 3)
-                    .shadow(color: Color.black.opacity(0.36), radius: 28, y: 15)
-                    .accessibilityHidden(true)
-            }
-            .padding(.bottom, 20)
-
-            Text("Opening SakuraCord")
-                .font(.system(size: 30, weight: .bold, design: .rounded))
-                .tracking(-0.5)
-                .foregroundStyle(.white)
-
-            HStack(spacing: 11) {
-                LoadingPulse(elapsed: elapsed, reduceMotion: reduceMotion)
-                Text(detail)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.72))
-            }
-            .padding(.top, 13)
-        }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("Opening SakuraCord. \(detail)")
     }
 
-    private var windowDragRegion: some View {
-        VStack(spacing: 0) {
-            Color.clear
-                .contentShape(Rectangle())
-                .frame(height: 52)
-                .gesture(WindowDragGesture())
-                .allowsWindowActivationEvents(true)
-            Spacer(minLength: 0)
+    private var sessionChrome: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            HStack(spacing: 0) {
+                serverRail
+                channelSidebar
+            }
+            .navigationSplitViewColumnWidth(
+                min: ChatChromeMetrics.serverRailWidth + 190,
+                ideal: ChatChromeMetrics.serverRailWidth + 230,
+                max: ChatChromeMetrics.serverRailWidth + 310
+            )
+        } detail: {
+            workspace
+                .navigationTitle("")
+                .toolbar { detailToolbar }
         }
+        .toolbar {
+            if !isAccountSwitch {
+                conversationToolbar
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            SkeletonShape(cornerRadius: 4)
+                .frame(width: 132, height: 14)
+                .offset(
+                    x: ChatChromeMetrics.sidebarTitleLeadingOffset,
+                    y: ChatChromeMetrics.sidebarTitleTopOffset + 7
+                )
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var embeddedChrome: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 0) {
+                serverRail
+                channelSidebar
+            }
+            .frame(width: embeddedSidebarWidth)
+            workspace
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var serverRail: some View {
+        ScrollView {
+            VStack(spacing: 10) {
+                railItem(cornerRadius: 14)
+                Divider().padding(.horizontal, 12)
+                ForEach(0 ..< SessionLoadingSkeletonLayout.serverCount, id: \.self) { _ in
+                    railItem(cornerRadius: 14)
+                }
+            }
+            .padding(
+                .top,
+                isAccountSwitch && !isEmbeddedInWorkspace
+                    ? ChatChromeMetrics.controlHeight
+                    : 0
+            )
+            .padding(.bottom, 12)
+        }
+        .scrollIndicators(.hidden)
+        .frame(width: ChatChromeMetrics.serverRailWidth)
+    }
+
+    private func railItem(cornerRadius: CGFloat) -> some View {
+        HStack(spacing: 5) {
+            Color.clear.frame(width: 7, height: 40)
+            SkeletonShape(cornerRadius: cornerRadius)
+                .frame(width: 44, height: 44)
+        }
+        .frame(width: ChatChromeMetrics.serverRailWidth, height: 46, alignment: .leading)
+    }
+
+    private var channelSidebar: some View {
+        VStack(spacing: 0) {
+            ChannelListLoadingSkeleton()
+
+            GlassEffectContainer(spacing: 0) {
+                HStack(spacing: 9) {
+                    SkeletonShape(cornerRadius: 17)
+                        .frame(width: 34, height: 34)
+                    VStack(alignment: .leading, spacing: 4) {
+                        SkeletonShape(cornerRadius: 4)
+                            .frame(width: 88, height: 11)
+                        SkeletonShape(cornerRadius: 3)
+                            .frame(width: 58, height: 8)
+                    }
+                    Spacer(minLength: 4)
+                    SkeletonShape(cornerRadius: 7)
+                        .frame(width: 22, height: 22)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: ChatChromeMetrics.controlHeight)
+                .glassEffect(
+                    .regular,
+                    in: ConcentricRectangle(
+                        corners: .concentric(
+                            minimum: .fixed(ChatChromeMetrics.composerMinimumCornerRadius)
+                        ),
+                        isUniform: true
+                    )
+                )
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+            .padding(.bottom, 12)
+        }
+        .overlay {
+            SidebarChromeSeparator(
+                cornerRadius: ChatChromeMetrics.sidebarContentCornerRadius,
+                strokeInset: 0.5
+            )
+            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var workspace: some View {
+        HStack(spacing: 0) {
+            messageTimeline
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            memberList
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var messageTimeline: some View {
+        MessageTimelineLoadingSkeleton(
+            bottomContentInset: ChatDetailLayoutPolicy.defaultFloatingFooterHeight
+        )
+        .overlay(alignment: .bottom) {
+            SkeletonShape(cornerRadius: ChatChromeMetrics.composerMinimumCornerRadius)
+            .frame(height: ChatChromeMetrics.controlHeight)
+            .padding(.horizontal, ChatChromeMetrics.composerWindowInset)
+            .padding(.bottom, ChatChromeMetrics.composerWindowInset)
+        }
+    }
+
+    private var memberList: some View {
+        MemberListLoadingSkeleton()
+        .frame(width: ChatChromeMetrics.memberListWidth)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ToolbarContentBuilder
+    private var conversationToolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            HStack(spacing: 8) {
+                SkeletonShape(cornerRadius: 4)
+                    .frame(width: 16, height: 16)
+                SkeletonShape(cornerRadius: 4)
+                    .frame(width: 112, height: 13)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+        }
+        .visibilityPriority(.high)
+    }
+
+    @ToolbarContentBuilder
+    private var detailToolbar: some ToolbarContent {
+        ToolbarSpacer(.flexible)
+        ToolbarItem {
+            HStack(spacing: 0) {
+                SkeletonShape(cornerRadius: 6)
+                    .frame(width: 20, height: 20)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .fixedSize()
+        }
+        .visibilityPriority(.high)
     }
 
     private var detail: String {
@@ -99,6 +318,18 @@ struct SakuraCordSessionLoadingView: View {
     }
 }
 
+struct SkeletonShape: View {
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(.white.opacity(0.09))
+            .skeletonShimmer()
+    }
+}
+
+// Shared by the signed-out login surface. The session-loading surface above
+// intentionally uses only structural placeholders.
 struct SakuraCordAuroraBackdrop: View {
     let elapsed: TimeInterval
 
@@ -146,26 +377,6 @@ struct SakuraCordAuroraBackdrop: View {
                 endRadius: 800
             )
         }
-    }
-}
-
-private struct LoadingPulse: View {
-    let elapsed: TimeInterval
-    let reduceMotion: Bool
-
-    var body: some View {
-        HStack(spacing: 4) {
-            ForEach(0 ..< 3, id: \.self) { index in
-                let phase = reduceMotion ? Double(index) * 0.5 : elapsed * 3.2 - Double(index) * 0.7
-                let amount = (sin(phase) + 1) / 2
-                Circle()
-                    .fill(Color(hex: 0xFF86B5))
-                    .frame(width: 5, height: 5)
-                    .scaleEffect(0.78 + amount * 0.32)
-                    .opacity(0.38 + amount * 0.62)
-            }
-        }
-        .accessibilityHidden(true)
     }
 }
 
@@ -221,7 +432,8 @@ private enum SakuraPetal {
         let duration = 10 + seed * 9
         let progress = fraction(elapsed / duration + secondarySeed)
         let baseX = seed * max(canvasSize.width, 1)
-        let sway = sin(elapsed * (0.45 + secondarySeed * 0.25) + seed * 12) * (22 + seed * 34)
+        let sway = sin(elapsed * (0.45 + secondarySeed * 0.25) + seed * 12)
+            * (22 + seed * 34)
         let width = max(canvasSize.width, 1)
         let horizontalPosition = wrapped(baseX + sway, limit: width)
         let verticalPosition = -30 + progress * (canvasSize.height + 60)

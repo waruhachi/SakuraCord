@@ -777,6 +777,18 @@ struct AccountReadStateModelTests {
             model.acknowledgementMetadata(channelID: channelID, now: twoDaysAfterEpoch)
                 == .init(flags: 1, lastViewed: 2)
         )
+        model.applyRemote(
+            ChannelReadState(
+                channelID: channelID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 10),
+                mentionCount: 0,
+                flags: 1
+            )
+        )
+        #expect(
+            model.acknowledgementMetadata(channelID: channelID, now: twoDaysAfterEpoch)
+                == .init(flags: nil, lastViewed: 2)
+        )
 
         let threadID = ChannelID(rawValue: 201)
         model.merge(
@@ -1377,6 +1389,34 @@ struct AccountReadStateModelTests {
         model.apply(
             GuildNotificationSettings(
                 guildID: guildID,
+                messageNotifications: .onlyMentions,
+                channelOverrides: [
+                    ChannelNotificationOverride(
+                        channelID: categoryID,
+                        messageNotifications: .allMessages,
+                        isMuted: true,
+                        muteConfiguration: active
+                    ),
+                    ChannelNotificationOverride(
+                        channelID: channelID,
+                        messageNotifications: .allMessages
+                    )
+                ]
+            )
+        )
+        #expect(model.isCategoryMuted(categoryID: categoryID, guildID: guildID))
+        #expect(!model.isCategoryCollapsed(categoryID: categoryID, guildID: guildID))
+        #expect(!model.isChannelMuted(channel))
+        #expect(!model.receive(message(id: 12), currentUserID: currentUser.id).shouldNotify)
+        #expect(model.unread(channelID: channelID))
+        #expect(!model.guildUnread(guildID))
+        let categoryMutedProjection = model.unreadPresentationProjection()
+        #expect(categoryMutedProjection.unreadByChannelID[channelID] == true)
+        #expect(categoryMutedProjection.unreadByGuildID[guildID] != true)
+
+        model.apply(
+            GuildNotificationSettings(
+                guildID: guildID,
                 messageNotifications: .allMessages,
                 channelOverrides: [
                     ChannelNotificationOverride(
@@ -1389,7 +1429,7 @@ struct AccountReadStateModelTests {
             )
         )
         #expect(model.isChannelMuted(channel))
-        #expect(!model.receive(message(id: 12), currentUserID: currentUser.id).shouldNotify)
+        #expect(!model.receive(message(id: 13), currentUserID: currentUser.id).shouldNotify)
     }
 
     @Test func `ordinary unread follows notification level when unread flags are absent`() {
@@ -1692,6 +1732,115 @@ struct AccountReadStateModelTests {
         #expect(model.entries.isEmpty)
     }
 
+    @Test func `one pass unread projection matches scalar account aggregates`() {
+        let forumID = ChannelID(rawValue: 250)
+        let newPostID = ChannelID(rawValue: 300)
+        let threadID = ChannelID(rawValue: 301)
+        let model = makeModel(latest: 12, acknowledged: 10, mentions: 2)
+        model.merge(channels: [
+            Channel(
+                id: forumID,
+                guildID: guildID,
+                name: "forum",
+                kind: .forum,
+                lastMessageID: MessageID(rawValue: newPostID.rawValue)
+            )
+        ])
+        model.applyRemote(
+            ChannelReadState(
+                channelID: forumID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 275)
+            )
+        )
+        model.merge(
+            forumPost: ForumPost(
+                thread: MessageThreadSummary(
+                    id: newPostID,
+                    guildID: guildID,
+                    parentID: forumID,
+                    name: "Unopened post",
+                    lastMessageID: MessageID(rawValue: newPostID.rawValue)
+                )
+            )
+        )
+        model.merge(
+            thread: MessageThreadSummary(
+                id: threadID,
+                guildID: guildID,
+                parentID: forumID,
+                name: "Mentioned thread",
+                lastMessageID: MessageID(rawValue: 310)
+            )
+        )
+        model.applyRemote(
+            ChannelReadState(
+                channelID: threadID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 309),
+                mentionCount: 1
+            )
+        )
+
+        let projection = model.unreadPresentationProjection()
+
+        for channelID in model.entries.keys {
+            #expect(
+                projection.unreadByChannelID[channelID]
+                    == model.unread(channelID: channelID)
+            )
+            #expect(
+                projection.mentionsByChannelID[channelID]
+                    == model.mentions(channelID: channelID)
+            )
+        }
+        #expect(
+            projection.newForumPostsByChannelID[forumID, default: 0]
+                == model.forumNewPostCount(channelID: forumID)
+        )
+        #expect(
+            projection.unreadByGuildID[guildID, default: false]
+                == model.guildUnread(guildID)
+        )
+        #expect(
+            projection.mentionsByGuildID[guildID, default: 0]
+                == model.guildMentions(guildID)
+        )
+        #expect(projection.totalMentions == model.totalMentions)
+    }
+
+    @Test func `one pass category unread projection matches acknowledgement eligibility`() {
+        let model = makeModel(latest: 11, acknowledged: 10)
+        #expect(model.unreadCategoryIDs(in: guildID) == [categoryID])
+        #expect(!model.bulkAcknowledgements(
+            for: categoryID,
+            guildID: guildID
+        ).isEmpty)
+
+        let threadID = ChannelID(rawValue: 201)
+        model.merge(
+            thread: MessageThreadSummary(
+                id: threadID,
+                guildID: guildID,
+                parentID: channelID,
+                name: "Post",
+                lastMessageID: MessageID(rawValue: 20)
+            )
+        )
+        model.applyRemote(
+            ChannelReadState(
+                channelID: threadID,
+                lastAcknowledgedMessageID: MessageID(rawValue: 19)
+            )
+        )
+        #expect(model.unreadCategoryIDs(in: guildID) == [categoryID])
+
+        model.applyAccessibility([channelID: false])
+        #expect(model.unreadCategoryIDs(in: guildID).isEmpty)
+        #expect(model.bulkAcknowledgements(
+            for: categoryID,
+            guildID: guildID
+        ).isEmpty)
+    }
+
     private func makeModel(
         latest: UInt64,
         acknowledged: UInt64,
@@ -1862,6 +2011,32 @@ struct AccountReadStateModelTests {
 @MainActor
 @Test func `qualified read acknowledgements have no arbitrary delay`() {
     #expect(AppModel.ReadAcknowledgementTiming().debounce == .zero)
+}
+
+@MainActor
+@Test func `automated benchmark emits no acknowledgement mutations`() async {
+    let provider = MockChatProvider()
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: provider,
+        runsChatPerformanceBenchmarkOverride: true
+    )
+    let channelID = ChannelID(rawValue: 99_920)
+    model.enqueueAcknowledgement(
+        channelID: channelID,
+        mutation: AppModel.ReadStateMutation(
+            messageID: MessageID(rawValue: 99_921),
+            manual: false,
+            mentionCount: nil,
+            flags: 0,
+            lastViewed: 0
+        )
+    )
+    await Task.yield()
+
+    #expect(await provider.acknowledgementRequests.isEmpty)
+    #expect(model.queuedAcknowledgements.isEmpty)
+    #expect(model.acknowledgementQueueOrder.isEmpty)
 }
 
 @MainActor

@@ -4,6 +4,7 @@ import Foundation
 import MessageRendering
 @testable import SakuraCord
 import SakuraCordModels
+import SakuraCordPersistence
 import Testing
 
 @MainActor
@@ -95,16 +96,14 @@ import Testing
     model.updateDraft("h")
     model.updateDraft("he")
     model.updateDraft("hello")
-    try? await Task.sleep(for: .milliseconds(25))
-    #expect(await provider.typingCount == 1)
+    #expect(await eventuallyTypingCount(1, from: provider))
     #expect(await provider.typingChannels == [textID])
 
     model.updateDraft("hello!")
     model.updateDraft("hello!!")
     try? await Task.sleep(for: .milliseconds(15))
     #expect(await provider.typingCount == 1)
-    try? await Task.sleep(for: .milliseconds(50))
-    #expect(await provider.typingCount == 2)
+    #expect(await eventuallyTypingCount(2, from: provider))
 
     model.updateDraft("pending")
     model.updateDraft("")
@@ -382,7 +381,7 @@ import Testing
 }
 
 @MainActor
-@Test func `composer stages at most ten unique attachments and clears them on navigation`() async {
+@Test func `composer stages at most ten attachments including repeated files and clears them on navigation`() async throws {
     let provider = TypingTestProvider()
     let model = AppModel(launchMode: .offlineTesting, provider: provider)
     await model.start()
@@ -390,12 +389,332 @@ import Testing
         URL(fileURLWithPath: "/tmp/sakuracord-composer-\($0)")
     }
 
-    #expect(model.addComposerAttachments(urls + [urls[0]], to: .channel))
-    #expect(model.channelComposerAttachments.map(\.url) == Array(urls.prefix(10)))
+    #expect(model.addComposerAttachments([urls[0], urls[0]] + urls.dropFirst(), to: .channel))
+    #expect(
+        model.channelComposerAttachments.map(\.url)
+            == [urls[0], urls[0]] + Array(urls.dropFirst().prefix(8))
+    )
+    #expect(Set(model.channelComposerAttachments.map(\.id)).count == 10)
     #expect(model.errorMessage?.contains("10") == true)
+
+    let firstID = try #require(model.channelComposerAttachments.first?.id)
+    model.removeComposerAttachment(firstID, from: .channel)
+    #expect(model.channelComposerAttachments.filter { $0.url == urls[0] }.count == 1)
 
     model.selectedChannelID = ChannelID(rawValue: 12)
     #expect(model.channelComposerAttachments.isEmpty)
+}
+
+@MainActor
+@Test func `oversized attachment is rejected at selection and external upload stays opt in`() async throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "sakuracord-attachment-limit-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let exact = directory.appendingPathComponent("exact.bin")
+    let oversized = directory.appendingPathComponent("oversized.bin")
+    try createSparseFile(exact, size: DiscordAttachmentUploadPolicy.baseLimit)
+    try createSparseFile(oversized, size: DiscordAttachmentUploadPolicy.baseLimit + 1)
+
+    let uploader = AttachmentUploadTestUploader(
+        result: URL(string: "https://files.catbox.moe/test.bin")!
+    )
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: TypingTestProvider(),
+        externalAttachmentUploader: uploader
+    )
+    await model.start()
+    model.snapshot?.currentUser.premiumType = 0
+
+    #expect(model.addComposerAttachments([exact, oversized], to: .channel))
+    #expect(model.channelComposerAttachments.map(\.url) == [exact])
+    let prompt = try #require(model.oversizedAttachmentPrompt)
+    #expect(prompt.fileURL == oversized)
+    #expect(prompt.discordLimit == DiscordAttachmentUploadPolicy.baseLimit)
+    #expect(prompt.availableServices == [.catbox, .litterbox])
+    #expect(await uploader.callCount == 0)
+
+    model.updateDraft("look")
+    model.uploadOversizedAttachment(prompt, using: .catbox)
+    #expect(await eventuallyOnMain { model.externalAttachmentUploadPresentation == nil })
+    #expect(await uploader.callCount == 1)
+    #expect(model.draft == "look https://files.catbox.moe/test.bin")
+}
+
+@MainActor
+@Test func `repeated alert dismissal cannot skip the next oversized attachment`() async throws {
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: TypingTestProvider()
+    )
+    await model.start()
+    let channelID = try #require(model.selectedChannelID)
+    let first = OversizedAttachmentPrompt(
+        fileURL: URL(fileURLWithPath: "/tmp/first-oversized.bin"),
+        fileSize: DiscordAttachmentUploadPolicy.baseLimit + 1,
+        discordLimit: DiscordAttachmentUploadPolicy.baseLimit,
+        premiumType: 0,
+        destination: .channel,
+        channelID: channelID
+    )
+    let second = OversizedAttachmentPrompt(
+        fileURL: URL(fileURLWithPath: "/tmp/second-oversized.bin"),
+        fileSize: DiscordAttachmentUploadPolicy.baseLimit + 1,
+        discordLimit: DiscordAttachmentUploadPolicy.baseLimit,
+        premiumType: 0,
+        destination: .channel,
+        channelID: channelID
+    )
+    model.oversizedAttachmentPrompt = first
+    model.queuedOversizedAttachmentPrompts = [second]
+
+    model.dismissOversizedAttachmentPrompt(id: first.id)
+    model.dismissOversizedAttachmentPrompt(id: first.id)
+
+    #expect(model.oversizedAttachmentPrompt?.id == second.id)
+    #expect(model.queuedOversizedAttachmentPrompts.isEmpty)
+}
+
+@MainActor
+@Test func `cancelled external upload cannot clear or populate its replacement`() async throws {
+    let uploader = SequencedAttachmentUploadTestUploader()
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: TypingTestProvider(),
+        externalAttachmentUploader: uploader
+    )
+    await model.start()
+    let channelID = try #require(model.selectedChannelID)
+    let first = OversizedAttachmentPrompt(
+        fileURL: URL(fileURLWithPath: "/tmp/first.bin"),
+        fileSize: DiscordAttachmentUploadPolicy.baseLimit + 1,
+        discordLimit: DiscordAttachmentUploadPolicy.baseLimit,
+        premiumType: 0,
+        destination: .channel,
+        channelID: channelID
+    )
+    let second = OversizedAttachmentPrompt(
+        fileURL: URL(fileURLWithPath: "/tmp/second.bin"),
+        fileSize: DiscordAttachmentUploadPolicy.baseLimit + 1,
+        discordLimit: DiscordAttachmentUploadPolicy.baseLimit,
+        premiumType: 0,
+        destination: .channel,
+        channelID: channelID
+    )
+    model.oversizedAttachmentPrompt = first
+    model.queuedOversizedAttachmentPrompts = [second]
+
+    model.uploadOversizedAttachment(first, using: .catbox)
+    #expect(await eventuallyUploadCallCount(1, from: uploader))
+    model.cancelExternalAttachmentUpload()
+    #expect(model.oversizedAttachmentPrompt?.fileURL == second.fileURL)
+
+    model.uploadOversizedAttachment(second, using: .catbox)
+    #expect(await eventuallyUploadCallCount(2, from: uploader))
+    await uploader.release(
+        call: 1,
+        with: URL(string: "https://files.catbox.moe/first.bin")!
+    )
+    #expect(await eventuallyOnMain {
+        model.externalAttachmentUploadPresentation?.fileName == "second.bin"
+    })
+    #expect(model.draft.isEmpty)
+
+    await uploader.release(
+        call: 2,
+        with: URL(string: "https://files.catbox.moe/second.bin")!
+    )
+    #expect(await eventuallyOnMain { model.externalAttachmentUploadPresentation == nil })
+    #expect(model.draft == "https://files.catbox.moe/second.bin")
+}
+
+@MainActor
+@Test func `account reset invalidates an external upload result`() async throws {
+    let uploader = SequencedAttachmentUploadTestUploader()
+    let model = AppModel(
+        launchMode: .offlineTesting,
+        provider: TypingTestProvider(),
+        externalAttachmentUploader: uploader
+    )
+    await model.start()
+    let channelID = try #require(model.selectedChannelID)
+    let prompt = OversizedAttachmentPrompt(
+        fileURL: URL(fileURLWithPath: "/tmp/account-reset.bin"),
+        fileSize: DiscordAttachmentUploadPolicy.baseLimit + 1,
+        discordLimit: DiscordAttachmentUploadPolicy.baseLimit,
+        premiumType: 0,
+        destination: .channel,
+        channelID: channelID
+    )
+    model.oversizedAttachmentPrompt = prompt
+    model.uploadOversizedAttachment(prompt, using: .catbox)
+    #expect(await eventuallyUploadCallCount(1, from: uploader))
+
+    model.resetAccountScopedLoadsAndForumState()
+    await uploader.release(
+        call: 1,
+        with: URL(string: "https://files.catbox.moe/stale.bin")!
+    )
+    #expect(await eventuallyOnMain { model.externalAttachmentUploadTask == nil })
+    #expect(model.externalAttachmentUploadPresentation == nil)
+    #expect(model.draft.isEmpty)
+}
+
+@Test func `external attachment hosts enforce size type and request contracts`() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "sakuracord-host-contract-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("notes.txt")
+    try Data("hello".utf8).write(to: file)
+    let blocked = directory.appendingPathComponent("unsafe.jar")
+
+    #expect(ExternalAttachmentHostingService.catbox.canUpload(
+        fileURL: file,
+        size: 200_000_000
+    ))
+    #expect(!ExternalAttachmentHostingService.catbox.canUpload(
+        fileURL: file,
+        size: 200_000_001
+    ))
+    #expect(ExternalAttachmentHostingService.litterbox.canUpload(
+        fileURL: file,
+        size: 1_000_000_000
+    ))
+    #expect(!ExternalAttachmentHostingService.litterbox.canUpload(
+        fileURL: file,
+        size: 1_000_000_001
+    ))
+    #expect(!ExternalAttachmentHostingService.litterbox.canUpload(fileURL: blocked, size: 1))
+
+    let catboxBody = try CatboxAttachmentUploader.makeMultipartFile(
+        sourceURL: file,
+        service: .catbox,
+        boundary: "test-boundary"
+    )
+    defer { try? FileManager.default.removeItem(at: catboxBody.deletingLastPathComponent()) }
+    let catboxText = String(decoding: try Data(contentsOf: catboxBody), as: UTF8.self)
+    #expect(catboxText.contains("name=\"reqtype\"\r\n\r\nfileupload"))
+    #expect(catboxText.contains("name=\"fileToUpload\"; filename=\"notes.txt\""))
+    #expect(!catboxText.contains("name=\"time\""))
+
+    let litterboxBody = try CatboxAttachmentUploader.makeMultipartFile(
+        sourceURL: file,
+        service: .litterbox,
+        boundary: "test-boundary"
+    )
+    defer { try? FileManager.default.removeItem(at: litterboxBody.deletingLastPathComponent()) }
+    let litterboxText = String(decoding: try Data(contentsOf: litterboxBody), as: UTF8.self)
+    #expect(litterboxText.contains("name=\"time\"\r\n\r\n24h"))
+}
+
+@MainActor
+@Test func `composer paste prefers arbitrary files over their compatibility path text`() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "sakuracord-paste-file-\(UUID().uuidString)",
+        isDirectory: true
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let file = directory.appendingPathComponent("notes.txt")
+    try Data("pasted file".utf8).write(to: file)
+
+    let pasteboard = NSPasteboard(name: .init("sakuracord-paste-file-\(UUID().uuidString)"))
+    defer { pasteboard.clearContents() }
+    pasteboard.clearContents()
+    #expect(pasteboard.writeObjects([file as NSURL]))
+    #expect(pasteboard.setString(file.path, forType: .string))
+
+    let textView = ComposerNSTextView()
+    textView.commandPasteboard = pasteboard
+    var pastedURLs: [URL] = []
+    textView.onPasteAttachments = { pastedURLs = $0 }
+    textView.paste(nil)
+
+    #expect(pastedURLs == [file])
+    #expect(textView.string.isEmpty)
+}
+
+@MainActor
+@Test func `composer paste materializes clipboard image data as a png attachment`() throws {
+    let pasteboard = NSPasteboard(name: .init("sakuracord-paste-image-\(UUID().uuidString)"))
+    defer { pasteboard.clearContents() }
+    let image = NSImage(size: NSSize(width: 2, height: 2), flipped: false) { bounds in
+        NSColor.systemPink.setFill()
+        bounds.fill()
+        return true
+    }
+    pasteboard.clearContents()
+    #expect(pasteboard.writeObjects([image]))
+
+    let url = try #require(ComposerPasteboardAttachments.urls(from: pasteboard).first)
+    defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+
+    #expect(url.pathExtension == "png")
+    #expect((try Data(contentsOf: url)).isEmpty == false)
+    #expect(NSImage(contentsOf: url)?.isValid == true)
+}
+
+@Test func `unfocused composer offers command v only for ordinary paste`() {
+    #expect(ComposerUnfocusedTypingMonitor.shouldOfferPaste(
+        keyCode: 9,
+        modifierFlags: .command
+    ))
+    #expect(!ComposerUnfocusedTypingMonitor.shouldOfferPaste(
+        keyCode: 9,
+        modifierFlags: [.command, .option]
+    ))
+    #expect(!ComposerUnfocusedTypingMonitor.shouldOfferPaste(
+        keyCode: 8,
+        modifierFlags: .command
+    ))
+
+    var handled = false
+    #expect(ComposerUnfocusedTypingMonitor.handlePaste(
+        keyCode: 9,
+        modifierFlags: .command,
+        onPasteAttachments: {
+            handled = true
+            return true
+        }
+    ))
+    #expect(handled)
+}
+
+@MainActor
+@Test func `promised attachment drops use isolated storage and publish successful files once`() throws {
+    let firstDirectory = try ComposerPromisedFileDropView.makeReceivingDirectory()
+    let secondDirectory = try ComposerPromisedFileDropView.makeReceivingDirectory()
+    defer {
+        try? FileManager.default.removeItem(at: firstDirectory)
+        try? FileManager.default.removeItem(at: secondDirectory)
+    }
+    #expect(firstDirectory != secondDirectory)
+    #expect(FileManager.default.fileExists(atPath: firstDirectory.path))
+    #expect(FileManager.default.fileExists(atPath: secondDirectory.path))
+
+    let screenshot = firstDirectory.appendingPathComponent("Screenshot.png")
+    try Data("promised screenshot".utf8).write(to: screenshot)
+    var completedBatch: ComposerPromisedFileBatch?
+    let collector = ComposerPromisedFileCollector(
+        expectedCount: 2,
+        directory: firstDirectory
+    ) {
+        completedBatch = $0
+    }
+    collector.receive(url: screenshot, error: nil)
+    #expect(completedBatch == nil)
+    collector.receive(
+        url: secondDirectory.appendingPathComponent("failed.png"),
+        error: CocoaError(.fileReadUnknown)
+    )
+    #expect(completedBatch?.urls == [screenshot])
+    #expect(completedBatch?.directory == firstDirectory)
 }
 
 @MainActor
@@ -428,7 +747,7 @@ import Testing
     model.addComposerAttachments([url], to: .channel)
     var attachment = try #require(model.channelComposerAttachments.first)
 
-    model.toggleComposerAttachmentSpoiler(url, in: .channel)
+    model.toggleComposerAttachmentSpoiler(attachment.id, in: .channel)
     #expect(model.channelComposerAttachments.first?.isSpoiler == true)
 
     attachment.filename = "renamed.png"
@@ -953,7 +1272,10 @@ import Testing
         discordNetworkDisabledOverride: false,
         restoresStoredSession: false,
         credentialStore: credentials,
-        authenticatedProviderFactory: { _, _ in MockChatProvider() }
+        authenticatedProviderFactory: { _, _ in MockChatProvider() },
+        accountDatabaseFactory: { _ in
+            try? SakuraCordDatabase(inMemory: true)
+        }
     )
     await model.start()
     #expect(
@@ -1720,6 +2042,79 @@ private func eventuallyOnMain(_ condition: @escaping @MainActor () -> Bool) asyn
         try? await Task.sleep(for: .milliseconds(1))
     }
     return condition()
+}
+
+private func eventuallyTypingCount(
+    _ expectedCount: Int,
+    from provider: TypingTestProvider
+) async -> Bool {
+    let deadline = ContinuousClock.now + .seconds(3)
+    repeat {
+        if await provider.typingCount == expectedCount {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(5))
+    } while ContinuousClock.now < deadline
+    return await provider.typingCount == expectedCount
+}
+
+private func eventuallyUploadCallCount(
+    _ expectedCount: Int,
+    from uploader: SequencedAttachmentUploadTestUploader
+) async -> Bool {
+    for _ in 0 ..< 200 {
+        if await uploader.callCount == expectedCount {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await uploader.callCount == expectedCount
+}
+
+private func createSparseFile(_ url: URL, size: Int64) throws {
+    guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+    try handle.truncate(atOffset: UInt64(size))
+}
+
+private actor AttachmentUploadTestUploader: ExternalAttachmentUploading {
+    let result: URL
+    private(set) var callCount = 0
+
+    init(result: URL) {
+        self.result = result
+    }
+
+    func upload(
+        fileURL _: URL,
+        using _: ExternalAttachmentHostingService
+    ) async throws -> URL {
+        callCount += 1
+        return result
+    }
+}
+
+private actor SequencedAttachmentUploadTestUploader: ExternalAttachmentUploading {
+    private(set) var callCount = 0
+    private var continuations: [Int: CheckedContinuation<URL, Never>] = [:]
+
+    func upload(
+        fileURL _: URL,
+        using _: ExternalAttachmentHostingService
+    ) async throws -> URL {
+        callCount += 1
+        let call = callCount
+        return await withCheckedContinuation { continuation in
+            continuations[call] = continuation
+        }
+    }
+
+    func release(call: Int, with url: URL) {
+        continuations.removeValue(forKey: call)?.resume(returning: url)
+    }
 }
 
 private actor TypingTestProvider: ChatProvider {

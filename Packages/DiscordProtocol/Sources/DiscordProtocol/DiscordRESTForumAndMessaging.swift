@@ -200,7 +200,13 @@ extension DiscordRESTProvider {
             throw ChatProviderError.invalidRequest("Select at least one tag before posting.")
         }
         progress(.preparing)
-        var message: [String: JSONValue] = ["content": .string(draft.content)]
+        var message: [String: JSONValue] = [
+            "content": .string(draft.content),
+            // The current first-party nested forum-post action always includes
+            // the selected sticker list. SakuraCord does not expose forum
+            // sticker sending, so the exact supported shape is an empty list.
+            "sticker_ids": .array([]),
+        ]
         if !draft.attachments.isEmpty {
             message["attachments"] = try await .array(
                 uploadForumAttachments(
@@ -644,6 +650,23 @@ extension DiscordRESTProvider {
         continuation?.yield(.forumPostsChanged(channelID: parentID, posts: posts))
     }
 
+    func reconcileJoinedThread(_ thread: MessageThreadSummary) {
+        if thread.notificationSettings != nil {
+            if cachedJoinedThreads[thread.id] == nil {
+                cachedJoinedThreadOrder.append(thread.id)
+            }
+            cachedJoinedThreads[thread.id] = thread
+        } else if let existing = cachedJoinedThreads[thread.id] {
+            var updated = thread
+            updated.notificationSettings = existing.notificationSettings
+            cachedJoinedThreads[thread.id] = updated
+        }
+    }
+
+    func publishActiveJoinedThreads() {
+        continuation?.yield(.activeJoinedThreadsChanged(currentActiveJoinedThreads()))
+    }
+
     func ingestForumThreads(
         _ threadDTOs: [ChannelDTO], fallbackGuildID: GuildID?,
         replacingParents: Set<ChannelID>? = nil,
@@ -686,12 +709,14 @@ extension DiscordRESTProvider {
                         } ?? false
             }
             cachedForumPosts[parentID, default: [:]][post.id] = post
+            reconcileJoinedThread(post.thread)
             cacheForumPreviewMessages(post)
             changed.insert(parentID)
         }
         for parentID in changed.union(replacingParents ?? []) {
             publishForumPosts(parentID: parentID)
         }
+        publishActiveJoinedThreads()
     }
 
     func advanceForumParentLatestThreadIDs(
@@ -851,7 +876,7 @@ extension DiscordRESTProvider {
         flags: UInt64?,
         lastViewed: Int?
     ) async throws -> ReadAcknowledgementResponse {
-        var body: [String: JSONValue] = [:]
+        var body: [String: JSONValue] = ["token": .null]
         if let token {
             body["token"] = .string(token)
         }
@@ -896,6 +921,89 @@ extension DiscordRESTProvider {
             channelID: channelID,
             override: [
                 "message_notifications": .number(Double(level.rawValue))
+            ]
+        )
+    }
+
+    public func acknowledgeBulk(
+        _ readStates: [BulkReadStateAcknowledgement]
+    ) async throws {
+        var acceptedReadStates: [BulkReadStateAcknowledgement] = []
+        for batch in readStates.chunked(maximumCount: 100) {
+            do {
+                try await requestEmpty(
+                    "/read-states/ack-bulk",
+                    method: "POST",
+                    body: [
+                        "read_states": .array(
+                            batch.map { readState in
+                                .object([
+                                    "channel_id": .string(readState.channelID.description),
+                                    "message_id": .string(readState.messageID.description),
+                                    "read_state_type": .number(0),
+                                ])
+                            }
+                        )
+                    ]
+                )
+                acceptedReadStates.append(contentsOf: batch)
+            } catch {
+                guard !acceptedReadStates.isEmpty else { throw error }
+                throw PartialBulkReadAcknowledgementError(
+                    acceptedReadStates: acceptedReadStates,
+                    failureDescription: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    public func updateGuildNotificationLevel(
+        guildID: GuildID,
+        level: MessageNotificationLevel
+    ) async throws {
+        try await updateGuildNotificationSettings(
+            guildID: guildID,
+            settings: [
+                "message_notifications": .number(Double(level.rawValue))
+            ]
+        )
+    }
+
+    public func updateGuildMute(
+        guildID: GuildID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {
+        var settings: [String: JSONValue] = ["muted": .bool(isMuted)]
+        if isMuted, let until {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            settings["mute_config"] = .object([
+                "end_time": .string(formatter.string(from: until)),
+            ])
+        } else {
+            settings["mute_config"] = .null
+        }
+        try await updateGuildNotificationSettings(
+            guildID: guildID,
+            settings: settings
+        )
+    }
+
+    func updateGuildNotificationSettings(
+        guildID: GuildID,
+        settings: [String: JSONValue]
+    ) async throws {
+        // The current first-party client sends one partial guild entry through
+        // the bulk user-guild settings route and reconciles the accepted value
+        // through USER_GUILD_SETTINGS_UPDATE.
+        try await requestEmpty(
+            "/users/@me/guilds/settings",
+            method: "PATCH",
+            body: [
+                "guilds": .object([
+                    guildID.description: .object(settings),
+                ])
             ]
         )
     }
@@ -950,8 +1058,76 @@ extension DiscordRESTProvider {
         )
     }
 
+    public func updateCategoryNotificationLevel(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        level: MessageNotificationLevel
+    ) async throws {
+        try await updateCategoryNotificationSettings(
+            guildID: guildID,
+            categoryID: categoryID,
+            override: [
+                "message_notifications": .number(Double(level.rawValue))
+            ]
+        )
+    }
+
+    public func updateCategoryMute(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {
+        var override: [String: JSONValue] = [
+            "muted": .bool(isMuted),
+            "mute_config": .null,
+        ]
+        if isMuted, let until {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            override["mute_config"] = .object([
+                "end_time": .string(formatter.string(from: until)),
+            ])
+        }
+        try await updateCategoryNotificationSettings(
+            guildID: guildID,
+            categoryID: categoryID,
+            override: override
+        )
+    }
+
+    public func updateCategoryCollapsed(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isCollapsed: Bool
+    ) async throws {
+        try await updateCategoryNotificationSettings(
+            guildID: guildID,
+            categoryID: categoryID,
+            override: ["collapsed": .bool(isCollapsed)]
+        )
+    }
+
+    func updateCategoryNotificationSettings(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        override: [String: JSONValue]
+    ) async throws {
+        // Category overrides and their collapsed state use the current bulk
+        // user-guild settings route, scoped to exactly one guild/category.
+        try await updateGuildNotificationSettings(
+            guildID: guildID,
+            settings: [
+                "channel_overrides": .object([
+                    categoryID.description: .object(override)
+                ])
+            ]
+        )
+    }
+
     public func supports(_ capability: ChatCapability) async -> Bool {
-        capability == .slashCommands || capability == .forums
+        capability == .slashCommands || capability == .forums || capability == .gifs
+            || capability == .messageForwarding
     }
 
     public func applicationCommandCatalog(for target: ApplicationCommandIndexTarget) async throws
@@ -1244,6 +1420,93 @@ extension DiscordRESTProvider {
         try await send(draft, progress: { _ in })
     }
 
+    public func ensurePrivateChannel(for userID: UserID) async throws -> Channel {
+        if let existing = (cachedChannels[nil] ?? []).first(where: {
+            $0.kind == .directMessage && $0.recipients.contains { $0.id == userID }
+        }) {
+            return existing
+        }
+        if let task = privateChannelTasks[userID] {
+            return try await task.value
+        }
+        let task = Task { [self] in
+            try await createPrivateChannel(for: userID)
+        }
+        privateChannelTasks[userID] = task
+        defer { privateChannelTasks[userID] = nil }
+        return try await task.value
+    }
+
+    private func createPrivateChannel(for userID: UserID) async throws -> Channel {
+        let dto: ChannelDTO = try await request(
+            "/users/@me/channels",
+            method: "POST",
+            body: ["recipients": .array([.string(userID.description)])]
+        )
+        let channel = try dto.domain(
+            guildID: nil,
+            knownUsersByID: cachedGatewayUsersByID
+        )
+        upsertPrivateChannel(channel)
+        continuation?.yield(.channelsChanged(
+            guildID: nil,
+            channels: cachedChannels[nil] ?? []
+        ))
+        return channel
+    }
+
+    public func forward(_ draft: ForwardMessageDraft) async throws -> Message {
+        let key = "forward:\(draft.destinationChannelID):\(draft.nonce)"
+        if let task = messageSendTasks[key] {
+            return try await task.value
+        }
+        let task = Task { [self] in
+            try await performForward(draft)
+        }
+        messageSendTasks[key] = task
+        defer { messageSendTasks[key] = nil }
+        return try await task.value
+    }
+
+    func performForward(_ draft: ForwardMessageDraft) async throws -> Message {
+        let isKnownChannel = cachedChannels.values.lazy.flatMap(\.self).contains(where: {
+            $0.id == draft.destinationChannelID
+        })
+        let isKnownThread = cachedForumPosts.values.contains { posts in
+            posts[draft.destinationChannelID] != nil
+        }
+        guard isKnownChannel || isKnownThread else {
+            throw ChatProviderError.channelNotFound
+        }
+        var reference: [String: JSONValue] = [
+            "type": .number(1),
+            "message_id": .string(draft.sourceMessageID.description),
+            "channel_id": .string(draft.sourceChannelID.description),
+        ]
+        if let sourceGuildID = draft.sourceGuildID {
+            reference["guild_id"] = .string(sourceGuildID.description)
+        }
+        let body: [String: JSONValue] = [
+            "content": .string(""),
+            "nonce": .string(draft.nonce),
+            "tts": .bool(false),
+            "flags": .number(0),
+            "mobile_network_type": .string("unknown"),
+            "message_reference": .object(reference),
+        ]
+        let dto: MessageDTO = try await request(
+            "/channels/\(draft.destinationChannelID)/messages",
+            method: "POST",
+            body: body,
+            headers: ["X-Context-Properties": DiscordClientMetadata.forwardingContextHeader]
+        )
+        var message = try dto.domain()
+        message.nonce = draft.nonce
+        cachedMessages[message.id] = message
+        continuation?.yield(.messageCreated(message))
+        return message
+    }
+
     public func send(
         _ draft: SendMessageDraft, progress: @escaping @Sendable (MessageSendProgress) -> Void
     ) async throws -> Message {
@@ -1281,7 +1544,12 @@ extension DiscordRESTProvider {
             "content": .string(draft.content),
             "nonce": .string(draft.nonce),
             "enforce_nonce": .bool(true),
-            "attachments": .array([]),
+            "tts": .bool(false),
+            "flags": .number(0),
+            // Chromium reports an unknown Network Information API connection
+            // type on the current macOS desktop host. The first-party send
+            // action forwards that value on every ordinary message POST.
+            "mobile_network_type": .string("unknown"),
         ]
         if let replyTo = draft.replyTo {
             body["message_reference"] = .object([
@@ -1375,6 +1643,9 @@ extension DiscordRESTProvider {
     {
         { [self] files, channelID, progress in
         var descriptors: [JSONValue] = []
+        let maximumFileSize = DiscordAttachmentUploadPolicy.maximumFileSize(
+            premiumType: currentUser?.premiumType ?? 0
+        )
         for (index, file) in files.enumerated() {
             let url = file.url
             let accessed = url.startAccessingSecurityScopedResource()
@@ -1385,6 +1656,11 @@ extension DiscordRESTProvider {
             }
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            guard Int64(size) <= maximumFileSize else {
+                throw ChatProviderError.invalidRequest(
+                    "\(file.name) exceeds the account's Discord upload limit."
+                )
+            }
             descriptors.append(
                 .object([
                     "filename": .string(file.name),
@@ -1410,7 +1686,9 @@ extension DiscordRESTProvider {
         for pair in zip(files, reservation.attachments) {
             let (file, slot) = pair
             let fileURL = file.url
-            guard let uploadURL = URL(string: slot.uploadURL) else {
+            guard let uploadURL = Self.validatedAttachmentUploadURL(
+                from: slot.uploadURL
+            ) else {
                 throw ChatProviderError.invalidRequest(
                     "Discord returned an invalid attachment upload URL.")
             }
@@ -1453,20 +1731,30 @@ extension DiscordRESTProvider {
                 )
                 throw error
             }
-            if let response = rawResponse as? HTTPURLResponse {
-                apiDiagnostics.recordHTTPResponse(
+            guard let response = rawResponse as? HTTPURLResponse else {
+                let error = ChatProviderError.invalidRequest(
+                    "Discord's attachment storage returned an invalid HTTP response."
+                )
+                apiDiagnostics.recordHTTPFailure(
                     transport: "attachment_storage",
                     method: "PUT",
                     path: "/attachments/\(slot.id)",
                     attempt: 1,
-                    response: response,
-                    body: Data(),
-                    duration: uploadStarted.duration(to: .now)
+                    duration: uploadStarted.duration(to: .now),
+                    error: error
                 )
+                throw error
             }
-            guard let response = rawResponse as? HTTPURLResponse,
-                  (200 ..< 300).contains(response.statusCode)
-            else {
+            apiDiagnostics.recordHTTPResponse(
+                transport: "attachment_storage",
+                method: "PUT",
+                path: "/attachments/\(slot.id)",
+                attempt: 1,
+                response: response,
+                body: Data(),
+                duration: uploadStarted.duration(to: .now)
+            )
+            guard (200 ..< 300).contains(response.statusCode) else {
                 throw ChatProviderError.invalidRequest(
                     "Discord's attachment storage rejected \(file.name)."
                 )
@@ -1482,6 +1770,16 @@ extension DiscordRESTProvider {
         }
         return uploaded
         }
+    }
+
+    nonisolated static func validatedAttachmentUploadURL(
+        from value: String
+    ) -> URL? {
+        guard let url = URL(string: value),
+              url.scheme?.lowercased() == "https",
+              url.host?.isEmpty == false
+        else { return nil }
+        return url
     }
 
     func uploadAttachmentFiles(
@@ -1647,4 +1945,13 @@ extension DiscordRESTProvider {
         return String(withoutAnimationPrefix)
     }
 
+}
+
+private extension Array {
+    func chunked(maximumCount: Int) -> [[Element]] {
+        guard maximumCount > 0 else { return [] }
+        return stride(from: 0, to: count, by: maximumCount).map { start in
+            Array(self[start ..< Swift.min(start + maximumCount, count)])
+        }
+    }
 }

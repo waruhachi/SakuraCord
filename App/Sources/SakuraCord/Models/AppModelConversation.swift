@@ -25,6 +25,15 @@ extension AppModel {
     }
 
     func beginSelectedChannelLoad() {
+        let cacheSignpost = AppPerformanceSignposts.signposter.beginInterval(
+            "ConversationCachePresentation"
+        )
+        defer {
+            AppPerformanceSignposts.signposter.endInterval(
+                "ConversationCachePresentation",
+                cacheSignpost
+            )
+        }
         channelLoadTask?.cancel()
         channelLoadGeneration &+= 1
         let generation = channelLoadGeneration
@@ -36,7 +45,8 @@ extension AppModel {
         replyingTo = nil
 
         guard let channelID = selectedChannelID,
-              selectedChannel?.kind != .voice || isVoiceChatOpen
+              selectedChannel?.kind != .voice || isVoiceChatOpen,
+              selectedConversationAccess.isReadable
         else {
             replaceSelectedMessages(with: [])
             draft = ""
@@ -47,82 +57,218 @@ extension AppModel {
         }
 
         let cachedMessages = takeCachedMessages(for: channelID)
-        replaceSelectedMessages(with: cachedMessages)
-        hasMoreMessages = hasMoreCache[channelID] ?? false
-        // Cached rows are immediately presentable, but the newest-page
-        // request is still in flight and the older-history boundary is
-        // unknown until it answers. Keeping this true suppresses a false
-        // channel beginning and exposes compact progress above cached rows.
+        let cachedRows = takeCachedMessageRows(for: channelID)
+        restoreSelectedMessages(
+            cachedMessages,
+            preparedRows: cachedRows
+        )
+        let cachedBoundary = hasMoreCache[channelID]
+        hasMoreMessages = cachedBoundary ?? false
+        if cachedBoundary != nil {
+            isLoadingMessages = false
+            hasCompletedInitialMessageLoad = true
+            readState.observeLoadedMessages(channelID: channelID, messages: messages)
+            preserveUnreadDividerIfNeeded(channelID: channelID)
+            reportConversationHistoryLoaded(channelID: channelID)
+            let account = accountSession()
+            channelLoadTask = startAccountChildTask(account: account) { model, account in
+                let savedDraft = await model.storedDraft(in: channelID, account: account)
+                guard model.isCurrentAccountSession(account),
+                      model.isCurrentLoad(channelID, generation: generation),
+                      model.draft.isEmpty
+                else { return }
+                model.draft = savedDraft
+            }
+            return
+        }
         isLoadingMessages = true
         preserveUnreadDividerIfNeeded(channelID: channelID)
         draft = ""
-        channelLoadTask = Task { [weak self] in
-            await self?.loadSelectedChannel(
+        let account = accountSession()
+        channelLoadTask = startAccountChildTask(account: account) { model, account in
+            await model.loadSelectedChannel(
                 channelID,
-                generation: generation
+                generation: generation,
+                account: account
+            )
+        }
+    }
+
+    func refreshSelectedChannelPreservingHistory() {
+        guard let channelID = selectedChannelID,
+              selectedChannel?.kind != .voice || isVoiceChatOpen,
+              selectedConversationAccess.isReadable
+        else { return }
+
+        channelLoadTask?.cancel()
+        channelLoadGeneration &+= 1
+        let generation = channelLoadGeneration
+        messageLoadError = nil
+        messageLoadErrorIsEarlierPage = false
+        isLoadingEarlier = false
+        let preservesLoadedHistory = !messages.isEmpty
+            && messages.allSatisfy { $0.channelID == channelID }
+        isLoadingMessages = !preservesLoadedHistory
+        hasCompletedInitialMessageLoad = preservesLoadedHistory
+
+        let account = accountSession()
+        channelLoadTask = startAccountChildTask(account: account) { model, account in
+            await model.loadSelectedChannel(
+                channelID,
+                generation: generation,
+                account: account
             )
         }
     }
 
     func loadSelectedChannel(
         _ channelID: ChannelID,
-        generation: Int
+        generation: Int,
+        account: AppModelAccountSession
     ) async {
-        async let cachedMessages = storedMessages(in: channelID)
-        async let storedDraft = storedDraft(in: channelID)
-        async let freshPage = provider.messages(
-            in: channelID,
-            before: nil,
-            limit: 100
+        guard isCurrentAccountSession(account),
+              isCurrentLoad(channelID, generation: generation)
+        else { return }
+        let loadSignpost = AppPerformanceSignposts.signposter.beginInterval(
+            "ConversationLoad"
         )
-
-        let cached = await cachedMessages
-        guard isCurrentLoad(channelID, generation: generation) else { return }
-        if messages.isEmpty, !cached.isEmpty {
-            replaceSelectedMessages(with: cached)
-            preserveUnreadDividerIfNeeded(channelID: channelID)
+        defer {
+            AppPerformanceSignposts.signposter.endInterval(
+                "ConversationLoad",
+                loadSignpost
+            )
+        }
+        let refreshRevision = beginConversationRefresh(in: channelID)
+        defer {
+            endConversationRefresh(
+                in: channelID,
+                revision: refreshRevision
+            )
+        }
+        async let storedDraft = storedDraft(in: channelID, account: account)
+        // Discord lets already-dispatched history reads finish when the user
+        // switches channels. Besides retaining the response in MessageStore,
+        // this also lets UserStore learn authors for account-wide picker
+        // search. Shield the provider read from presentation-task cancellation
+        // and discard only its stale UI result below. This avoids repeatedly
+        // cancelling URLSession HTTP/3 streams during fast navigation, which
+        // can leave the reused connection stalled on macOS.
+        let freshPageTask = Task {
+            try await account.provider.messages(
+                in: channelID,
+                before: nil,
+                limit: 10
+            )
         }
 
         let savedDraft = await storedDraft
-        guard isCurrentLoad(channelID, generation: generation) else { return }
+        guard isCurrentAccountSession(account),
+              isCurrentLoad(channelID, generation: generation)
+        else { return }
         if draft.isEmpty {
             draft = savedDraft
         }
 
         do {
-            let page = try await freshPage
-            guard isCurrentLoad(channelID, generation: generation) else { return }
-            let merged = Self.merging(
+            let page = try await freshPageTask.value
+            guard isCurrentAccountSession(account),
+                  isCurrentLoad(channelID, generation: generation)
+            else { return }
+            let initialMutations = conversationRefreshMutations(
+                in: channelID,
+                revision: refreshRevision
+            )
+            let refreshedMessages = Self.applyingConversationRefreshMutations(
+                initialMutations,
+                to: page.messages
+            )
+            let merged = Self.reconcilingNewestPage(
                 current: messages,
-                fresh: page.messages
+                fresh: refreshedMessages,
+                hasMoreBefore: page.hasMoreBefore,
+                authoritativeOldestMessageID: page.messages.map(\.id).min()
             )
             if merged != messages {
                 replaceSelectedMessages(with: merged)
             }
+            reportStartupContentReady(channelID)
             await resolveSelectedHistoryMembers(
                 channelID: channelID,
-                generation: generation
+                generation: generation,
+                session: account
             )
-            guard isCurrentLoad(channelID, generation: generation) else { return }
+            guard isCurrentAccountSession(account),
+                  isCurrentLoad(channelID, generation: generation)
+            else { return }
             try await finishSelectedChannelLoad(
                 channelID: channelID,
-                hasMoreBefore: page.hasMoreBefore
+                freshMessages: page.messages,
+                refreshRevision: refreshRevision,
+                hasMoreBefore: page.hasMoreBefore,
+                session: account
             )
         } catch is CancellationError {
             return
         } catch {
-            guard isCurrentLoad(channelID, generation: generation) else { return }
-            messageLoadError = error.localizedDescription
-            messageLoadErrorIsEarlierPage = false
-            isLoadingMessages = false
-            hasCompletedInitialMessageLoad = true
+            handleSelectedChannelLoadFailure(
+                error,
+                channelID: channelID,
+                generation: generation,
+                account: account
+            )
         }
+    }
+
+    private func handleSelectedChannelLoadFailure(
+        _ error: Error,
+        channelID: ChannelID,
+        generation: Int,
+        account: AppModelAccountSession
+    ) {
+        guard isCurrentAccountSession(account),
+              isCurrentLoad(channelID, generation: generation)
+        else { return }
+        messageLoadError = error.localizedDescription
+        messageLoadErrorIsEarlierPage = false
+        isLoadingMessages = false
+        hasCompletedInitialMessageLoad = true
+    }
+
+    private func reportStartupContentReady(
+        _ channelID: ChannelID,
+        acceptsEmpty: Bool = false
+    ) {
+        guard acceptsEmpty || !messages.isEmpty else { return }
+        AppPerformanceSignposts.reportStartupConversationHistoryReady(
+            channelID: channelID
+        )
     }
 
     func finishSelectedChannelLoad(
         channelID: ChannelID,
-        hasMoreBefore: Bool
+        freshMessages: [Message],
+        refreshRevision: UInt64,
+        hasMoreBefore: Bool,
+        session: AppModelAccountSession
     ) async throws {
+        guard isCurrentAccountSession(session) else { return }
+        let mutations = conversationRefreshMutations(
+            in: channelID,
+            revision: refreshRevision
+        )
+        let refreshedMessages = Self.applyingConversationRefreshMutations(
+            mutations,
+            to: freshMessages
+        )
+        let reconciledMessages = Self.reconcilingNewestPage(
+            current: messages,
+            fresh: refreshedMessages,
+            hasMoreBefore: hasMoreBefore,
+            authoritativeOldestMessageID: freshMessages.map(\.id).min()
+        )
+        if reconciledMessages != messages {
+            replaceSelectedMessages(with: reconciledMessages)
+        }
         hasMoreMessages = hasMoreBefore
         hasMoreCache[channelID] = hasMoreBefore
         messageLoadError = nil
@@ -132,12 +278,12 @@ extension AppModel {
         readState.observeLoadedMessages(channelID: channelID, messages: messages)
         preserveUnreadDividerIfNeeded(channelID: channelID)
         reportConversationHistoryLoaded(channelID: channelID)
-        try await database?.save(messages: messages)
     }
 
     func resolveSelectedHistoryMembers(
         channelID: ChannelID,
-        generation: Int
+        generation: Int,
+        session: AppModelAccountSession
     ) async {
         guard let guildID = selectedChannel?.guildID,
               selectedChannel?.id == channelID
@@ -150,25 +296,50 @@ extension AppModel {
         guard !requested.isEmpty else { return }
 
         do {
-            let resolved = try await provider.resolveMembers(
+            let resolved = try await session.provider.resolveMembers(
                 in: guildID,
                 userIDs: requested
             )
-            guard isCurrentLoad(channelID, generation: generation), !resolved.isEmpty else {
+            guard isCurrentAccountSession(session),
+                  isCurrentLoad(channelID, generation: generation),
+                  !resolved.isEmpty
+            else {
                 return
             }
+            let previousMembersByID = membersByID
             let indexed = mergedMemberStore(with: resolved)
             if membersByID != indexed {
                 membersByID = indexed
-                invalidateTimelinePresentation()
             }
+            let changedUserIDs = TimelineMemberPresentationImpact.changedUserIDs(
+                from: previousMembersByID,
+                to: indexed,
+                guildRoles: guildRoles
+            )
+            let affectedMessageIDs = TimelineMemberPresentationImpact
+                .affectedMessageIDs(
+                    in: messages,
+                    changedUserIDs: changedUserIDs
+                )
             let hydrated = LocalHistoryMemberResolution.hydrating(
                 messages,
                 with: indexed
             )
             if hydrated != messages {
-                replaceSelectedMessages(with: hydrated)
+                applySelectedHistoryMemberHydration(
+                    hydrated,
+                    presentationMessageIDs: affectedMessageIDs
+                )
+            } else if !affectedMessageIDs.isEmpty {
+                publishMessageRowsUpdate(
+                    changedMessageIDs: affectedMessageIDs
+                )
             }
+            publishTimelineMemberPresentationChanges(
+                from: previousMembersByID,
+                to: indexed,
+                publishesCurrentRows: false
+            )
         } catch is CancellationError {
             return
         } catch {
@@ -177,7 +348,9 @@ extension AppModel {
         }
     }
 
-    func loadEarlier() async {
+    func loadEarlier(account: AppModelAccountSession? = nil) async {
+        let session = account ?? accountSession()
+        guard !Task.isCancelled, isCurrentAccountSession(session) else { return }
         guard let channelID = selectedChannelID, let first = messages.first, hasMoreMessages,
               !isLoadingEarlier
         else { return }
@@ -185,13 +358,20 @@ extension AppModel {
         messageLoadErrorIsEarlierPage = false
         isLoadingEarlier = true
         defer {
-            if selectedChannelID == channelID {
+            if isCurrentAccountSession(session), selectedChannelID == channelID {
                 isLoadingEarlier = false
             }
         }
         do {
-            let page = try await provider.messages(in: channelID, before: first.id, limit: 50)
-            guard !Task.isCancelled, selectedChannelID == channelID else { return }
+            let page = try await session.provider.messages(
+                in: channelID,
+                before: first.id,
+                limit: 50
+            )
+            guard !Task.isCancelled,
+                  isCurrentAccountSession(session),
+                  selectedChannelID == channelID
+            else { return }
             let reconcileStart = ProcessInfo.processInfo.systemUptime
             let earlier = page.messages.filter {
                 !selectedMessageIDs.contains($0.id)
@@ -221,11 +401,12 @@ extension AppModel {
                     )
                 }
             }
-            try await database?.save(messages: page.messages)
         } catch is CancellationError {
             return
         } catch {
-            guard selectedChannelID == channelID else { return }
+            guard isCurrentAccountSession(session),
+                  selectedChannelID == channelID
+            else { return }
             messageLoadError = error.localizedDescription
             messageLoadErrorIsEarlierPage = true
         }
@@ -236,8 +417,9 @@ extension AppModel {
         if messageLoadErrorIsEarlierPage {
             messageLoadError = nil
             messageLoadErrorIsEarlierPage = false
-            Task { [weak self] in
-                await self?.loadEarlier()
+            let account = accountSession()
+            startAccountChildTask(account: account) { model, account in
+                await model.loadEarlier(account: account)
             }
             return
         }
@@ -245,14 +427,33 @@ extension AppModel {
     }
 
     func reply(to message: Message) {
-        guard message.channelID == selectedChannelID else { return }
-        replyingTo = message
-        NotificationCenter.default.post(name: .sakuracordFocusComposer, object: nil)
+        let destination: MessageComposerDestination
+        if message.channelID == selectedChannelID {
+            replyingTo = message
+            destination = .channel
+        } else if message.channelID == openThread?.id {
+            threadReplyingTo = message
+            destination = .thread
+        } else {
+            return
+        }
+        NotificationCenter.default.post(
+            name: .sakuracordFocusComposer,
+            object: destination
+        )
     }
 
-    func cancelReply() {
-        replyingTo = nil
-        NotificationCenter.default.post(name: .sakuracordFocusComposer, object: nil)
+    func cancelReply(in destination: MessageComposerDestination = .channel) {
+        switch destination {
+        case .channel:
+            replyingTo = nil
+        case .thread:
+            threadReplyingTo = nil
+        }
+        NotificationCenter.default.post(
+            name: .sakuracordFocusComposer,
+            object: destination
+        )
     }
 
     func open(_ thread: MessageThreadSummary) {
@@ -284,8 +485,10 @@ extension AppModel {
         initialMessages: [Message]
     ) {
         threadLoadTask?.cancel()
+        AppPerformanceSignposts.beginConversationNavigation(to: thread.id)
         readState.merge(thread: thread)
         openThread = thread
+        recordForwardDestinationVisit(thread.id)
         _ = readState.updatePresentation(
             channelID: thread.id,
             isPresented: true,
@@ -297,56 +500,123 @@ extension AppModel {
         )
         openThreadStarter = starter
         openThreadStartedAt = startedAt
-        threadMessages = initialMessages
+        let cachedMessages = takeCachedMessages(for: thread.id)
+        let cachedBoundary = hasMoreCache[thread.id]
+        threadMessages = Self.merging(
+            current: initialMessages,
+            fresh: cachedMessages
+        )
         threadDraft = ""
-        threadComposerAttachments = []
-        hasMoreThreadMessages = false
+        threadReplyingTo = nil
+        clearComposerAttachments(for: .thread)
+        hasMoreThreadMessages = cachedBoundary ?? false
         beginInitialThreadLoad(thread)
     }
 
-    func beginInitialThreadLoad(
-        _ thread: MessageThreadSummary
-    ) {
+    func beginInitialThreadLoad(_ thread: MessageThreadSummary) {
         threadLoadTask?.cancel()
         threadErrorMessage = nil
         threadErrorScope = nil
+        if hasMoreCache[thread.id] != nil {
+            isLoadingThread = false
+            hasCompletedInitialThreadLoad = true
+            readState.observeLoadedMessages(
+                channelID: thread.id,
+                messages: threadMessages
+            )
+            reportConversationHistoryLoaded(channelID: thread.id)
+            return
+        }
         isLoadingThread = true
         hasCompletedInitialThreadLoad = false
-        threadLoadTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let page = try await provider.messages(
+        let account = accountSession()
+        threadLoadTask = startAccountChildTask(account: account) { model, account in
+            let refreshRevision = model.beginConversationRefresh(in: thread.id)
+            defer {
+                model.endConversationRefresh(
                     in: thread.id,
-                    before: nil,
-                    limit: 100
+                    revision: refreshRevision
                 )
-                guard !Task.isCancelled, openThread?.id == thread.id else { return }
-                threadMessages = page.messages.sorted { $0.timestamp < $1.timestamp }
-                hasMoreThreadMessages = page.hasMoreBefore
-                threadErrorMessage = nil
-                threadErrorScope = nil
-                isLoadingThread = false
-                hasCompletedInitialThreadLoad = true
-                readState.observeLoadedMessages(
-                    channelID: thread.id,
-                    messages: threadMessages
+            }
+            let loadSignpost = AppPerformanceSignposts.signposter.beginInterval(
+                "ThreadConversationLoad"
+            )
+            defer {
+                AppPerformanceSignposts.signposter.endInterval(
+                    "ThreadConversationLoad",
+                    loadSignpost
                 )
-                reportConversationHistoryLoaded(channelID: thread.id)
-                try await database?.save(messages: page.messages)
+            }
+            async let freshPage = account.provider.messages(
+                in: thread.id,
+                before: nil,
+                limit: 100
+            )
+            do {
+                let page = try await freshPage
+                guard !Task.isCancelled,
+                      model.isCurrentAccountSession(account),
+                      model.openThread?.id == thread.id
+                else { return }
+                try await model.finishInitialThreadLoad(
+                    page,
+                    threadID: thread.id,
+                    refreshRevision: refreshRevision,
+                    session: account
+                )
             } catch is CancellationError {
                 return
             } catch {
-                guard openThread?.id == thread.id else { return }
-                threadErrorMessage = error.localizedDescription
-                threadErrorScope = .initialPage
-                isLoadingThread = false
-                hasCompletedInitialThreadLoad = true
+                guard model.isCurrentAccountSession(account),
+                      model.openThread?.id == thread.id
+                else { return }
+                model.threadErrorMessage = error.localizedDescription
+                model.threadErrorScope = .initialPage
+                model.isLoadingThread = false
+                model.hasCompletedInitialThreadLoad = true
             }
         }
     }
 
+    func finishInitialThreadLoad(
+        _ page: MessagePage,
+        threadID: ChannelID,
+        refreshRevision: UInt64,
+        session: AppModelAccountSession
+    ) async throws {
+        guard isCurrentAccountSession(session) else { return }
+        let mutations = conversationRefreshMutations(
+            in: threadID,
+            revision: refreshRevision
+        )
+        let refreshedMessages = Self.applyingConversationRefreshMutations(
+            mutations,
+            to: page.messages
+        )
+        threadMessages = Self.reconcilingNewestPage(
+            current: threadMessages,
+            fresh: refreshedMessages,
+            hasMoreBefore: page.hasMoreBefore,
+            authoritativeOldestMessageID: page.messages.map(\.id).min()
+        )
+        hasMoreThreadMessages = page.hasMoreBefore
+        threadErrorMessage = nil
+        threadErrorScope = nil
+        isLoadingThread = false
+        hasCompletedInitialThreadLoad = true
+        readState.observeLoadedMessages(
+            channelID: threadID,
+            messages: threadMessages
+        )
+        reportConversationHistoryLoaded(channelID: threadID)
+        hasMoreCache[threadID] = page.hasMoreBefore
+    }
+
     func closeThread() {
         if let threadID = openThread?.id {
+            cancelConversationRefresh(in: threadID)
+            storeCachedMessages(threadMessages, for: threadID)
+            hasMoreCache[threadID] = hasMoreThreadMessages
             unreadDividerMessageIDs[threadID] = nil
             if conversationNewestRequest?.channelID == threadID {
                 conversationNewestRequest = nil
@@ -360,7 +630,8 @@ extension AppModel {
         openThreadStartedAt = nil
         threadMessages = []
         threadDraft = ""
-        threadComposerAttachments = []
+        threadReplyingTo = nil
+        clearComposerAttachments(for: .thread)
         isLoadingThread = false
         hasCompletedInitialThreadLoad = false
         isLoadingEarlierThread = false
@@ -381,6 +652,9 @@ extension AppModel {
 
     func closeVoiceChat() {
         guard isVoiceChatOpen else { return }
+        if let selectedChannelID {
+            cancelConversationRefresh(in: selectedChannelID)
+        }
         channelLoadTask?.cancel()
         channelLoadTask = nil
         channelLoadGeneration &+= 1
@@ -390,7 +664,9 @@ extension AppModel {
         messageLoadError = nil
     }
 
-    func loadEarlierThread() async {
+    func loadEarlierThread(account: AppModelAccountSession? = nil) async {
+        let session = account ?? accountSession()
+        guard !Task.isCancelled, isCurrentAccountSession(session) else { return }
         guard let thread = openThread, let first = threadMessages.first, hasMoreThreadMessages,
               !isLoadingEarlierThread
         else { return }
@@ -398,23 +674,32 @@ extension AppModel {
         threadErrorScope = nil
         isLoadingEarlierThread = true
         defer {
-            if openThread?.id == thread.id {
+            if isCurrentAccountSession(session), openThread?.id == thread.id {
                 isLoadingEarlierThread = false
             }
         }
         do {
-            let page = try await provider.messages(in: thread.id, before: first.id, limit: 50)
-            guard !Task.isCancelled, openThread?.id == thread.id else { return }
+            let page = try await session.provider.messages(
+                in: thread.id,
+                before: first.id,
+                limit: 50
+            )
+            guard !Task.isCancelled,
+                  isCurrentAccountSession(session),
+                  openThread?.id == thread.id
+            else { return }
             let ids = Set(threadMessages.map(\.id))
             threadMessages.insert(contentsOf: page.messages.filter { !ids.contains($0.id) }, at: 0)
             hasMoreThreadMessages = page.hasMoreBefore
             threadErrorMessage = nil
             threadErrorScope = nil
-            try await database?.save(messages: page.messages)
+            hasMoreCache[thread.id] = page.hasMoreBefore
         } catch is CancellationError {
             return
         } catch {
-            guard openThread?.id == thread.id else { return }
+            guard isCurrentAccountSession(session),
+                  openThread?.id == thread.id
+            else { return }
             threadErrorMessage = error.localizedDescription
             threadErrorScope = .earlierPage
         }
@@ -428,8 +713,9 @@ extension AppModel {
         case .earlierPage:
             threadErrorMessage = nil
             threadErrorScope = nil
-            Task { [weak self] in
-                await self?.loadEarlierThread()
+            let account = accountSession()
+            startAccountChildTask(account: account) { model, account in
+                await model.loadEarlierThread(account: account)
             }
         case .action, nil:
             return
@@ -449,8 +735,10 @@ extension AppModel {
         let content = threadDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty || !attachments.isEmpty else { return false }
         guard validateAttachmentCount(attachments) else { return false }
+        let replyTo = threadReplyingTo?.id
         return await sendThreadMessage(
             content: content,
+            replyTo: replyTo,
             attachments: attachments,
             thread: thread,
             clearsComposer: true
@@ -460,6 +748,7 @@ extension AppModel {
     @discardableResult
     func sendThreadMessage(
         content: String,
+        replyTo: MessageID? = nil,
         attachments: [ForumPostAttachment],
         thread: MessageThreadSummary,
         clearsComposer: Bool
@@ -467,28 +756,27 @@ extension AppModel {
         let draft = SendMessageDraft(
             channelID: thread.id,
             content: content,
+            replyTo: replyTo,
             attachments: attachments
         )
         threadErrorMessage = nil
         threadErrorScope = nil
         if clearsComposer {
             threadDraft = ""
+            threadReplyingTo = nil
         }
+        let session = accountSession()
         do {
-            let message = try await provider.send(draft)
+            let message = try await session.provider.send(draft)
+            guard isCurrentAccountSession(session) else { return false }
             guard openThread?.id == thread.id else { return true }
-            var updated = threadMessages
-            updated.removeAll {
-                $0.id == message.id || ($0.nonce != nil && $0.nonce == message.nonce)
-            }
-            Self.insert(message, intoSorted: &updated)
-            if updated != threadMessages {
-                threadMessages = updated
-            }
-            try await database?.save(messages: [message])
+            let reconciled = reconcileVisibleOrCached(message)
+            journalAuthoritativeMessageUpsert(reconciled)
+            guard isCurrentAccountSession(session) else { return false }
             completeConversationReadingAndAdvance(channelID: thread.id)
             return true
         } catch {
+            guard isCurrentAccountSession(session) else { return false }
             guard openThread?.id == thread.id else { return false }
             if clearsComposer, threadDraft.isEmpty {
                 threadDraft = content
@@ -507,7 +795,11 @@ extension AppModel {
             scheduleLocalTyping(for: value)
         }
         guard let channelID = selectedChannelID else { return }
-        Task { try? await database?.saveDraft(value, channelID: channelID) }
+        let session = accountSession()
+        Task { [weak self] in
+            guard let self, self.isCurrentAccountSession(session) else { return }
+            try? await session.database?.saveDraft(value, channelID: channelID)
+        }
     }
 
     func loadApplicationCommands() {
@@ -527,15 +819,19 @@ extension AppModel {
         let targets: Set<ApplicationCommandIndexTarget> = [contextTarget, .user]
         commandComposer.beginLoading(targets: targets)
         commandLoadTask?.cancel()
+        let account = accountSession()
         commandLoadTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  isCurrentAccountSession(account)
+            else { return }
             do {
                 async let context: ApplicationCommandCatalog? =
-                    try? provider.applicationCommandCatalog(
+                    try? account.provider.applicationCommandCatalog(
                         for: contextTarget
                     )
                 async let user: ApplicationCommandCatalog? =
-                    try? provider.applicationCommandCatalog(
+                    try? account.provider.applicationCommandCatalog(
                         for: .user
                     )
                 let catalogs = await [context, user].compactMap(\.self)
@@ -544,7 +840,10 @@ extension AppModel {
                         "Discord did not return an application command index for this conversation."
                     )
                 }
-                guard !Task.isCancelled, selectedChannelID == channel.id else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(account),
+                      selectedChannelID == channel.id
+                else { return }
                 let roleIDs = Set(
                     (snapshot?.currentUser.id).flatMap { membersByID[$0] }?.roles.map(\.id) ?? []
                 )
@@ -557,7 +856,10 @@ extension AppModel {
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled, selectedChannelID == channel.id else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(account),
+                      selectedChannelID == channel.id
+                else { return }
                 commandComposer.failLoading(error.localizedDescription)
             }
         }
@@ -588,16 +890,19 @@ extension AppModel {
         case .request:
             commandAutocompleteTask?.cancel()
         }
+        let session = accountSession()
         commandAutocompleteTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await Task.sleep(for: .milliseconds(200))
                 try Task.checkCancellation()
-                try await provider.requestApplicationCommandAutocomplete(request)
+                try await session.provider.requestApplicationCommandAutocomplete(request)
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 commandComposer.failAutocomplete(
                     nonce: request.nonce, message: error.localizedDescription
                 )
@@ -632,15 +937,18 @@ extension AppModel {
         commandMemberSearchTask?.cancel()
         commandMemberSearchQuery = key
         commandMemberResults = []
+        let session = accountSession()
         commandMemberSearchTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await Task.sleep(for: .milliseconds(250))
                 try Task.checkCancellation()
-                let results = try await provider.searchMembers(
+                let results = try await session.provider.searchMembers(
                     in: guildID, query: normalized, limit: 20
                 )
-                guard !Task.isCancelled, commandMemberSearchQuery == key,
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      commandMemberSearchQuery == key,
                       selectedGuildID == guildID
                 else { return }
                 commandMemberSearchCache[key] = results
@@ -650,7 +958,9 @@ extension AppModel {
             } catch is CancellationError {
                 return
             } catch {
-                guard commandMemberSearchQuery == key else { return }
+                guard isCurrentAccountSession(session),
+                      commandMemberSearchQuery == key
+                else { return }
                 commandMemberSearchQuery = nil
                 commandMemberSearchTask = nil
                 commandMemberResults = []
@@ -686,16 +996,19 @@ extension AppModel {
         mentionMemberSearchTask?.cancel()
         mentionMemberSearchQuery = key
         mentionMemberResults = []
+        let session = accountSession()
         mentionMemberSearchTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await Task.sleep(for: .milliseconds(200))
                 try Task.checkCancellation()
-                let results = try await provider.searchMembers(
+                let results = try await session.provider.searchMembers(
                     in: guildID, query: key.query, limit: 10
                 )
-                let roles = try? await provider.roles(in: guildID)
-                guard !Task.isCancelled, mentionMemberSearchQuery == key,
+                let roles = try? await session.provider.roles(in: guildID)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      mentionMemberSearchQuery == key,
                       selectedGuildID == guildID
                 else { return }
                 if let roles { applyGuildRoles(roles, to: guildID) }
@@ -710,7 +1023,9 @@ extension AppModel {
             } catch is CancellationError {
                 return
             } catch {
-                guard mentionMemberSearchQuery == key else { return }
+                guard isCurrentAccountSession(session),
+                      mentionMemberSearchQuery == key
+                else { return }
                 mentionMemberSearchQuery = nil
                 mentionMemberResults = []
             }
@@ -746,20 +1061,28 @@ extension AppModel {
             return
         }
         isLoadingRoleMembers = true
+        let session = accountSession()
         roleMemberTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await provider.members(withRole: roleID, in: guildID)
-                guard !Task.isCancelled, selectedGuildID == guildID else { return }
+                let result = try await session.provider.members(withRole: roleID, in: guildID)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      selectedGuildID == guildID
+                else { return }
                 roleMemberResult = result
                 for member in result.members { knownMentionMembers[member.id] = member }
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 roleMemberErrorMessage = error.localizedDescription
             }
-            isLoadingRoleMembers = false
+            if isCurrentAccountSession(session) {
+                isLoadingRoleMembers = false
+            }
         }
     }
 
@@ -773,18 +1096,27 @@ extension AppModel {
         commandAutocompleteTask?.cancel()
         stopLocalTyping(clearThrottle: true)
         updateDraft("")
+        let session = accountSession()
         commandExecutionTask = Task { [weak self] in
             guard let self else { return }
-            defer { commandExecutionTask = nil }
+            defer {
+                if isCurrentAccountSession(session) {
+                    commandExecutionTask = nil
+                }
+            }
             do {
-                try await provider.executeApplicationCommand(invocation) { [weak self] progress in
+                try await session.provider.executeApplicationCommand(invocation) { [weak self] progress in
                     Task { @MainActor in
-                        self?.commandComposer.updateExecutionProgress(progress)
+                        guard let self,
+                              self.isCurrentAccountSession(session)
+                        else { return }
+                        self.commandComposer.updateExecutionProgress(progress)
                     }
                 }
             } catch is CancellationError {
                 return
             } catch {
+                guard isCurrentAccountSession(session) else { return }
                 commandComposer.failExecution(error.localizedDescription)
             }
         }
@@ -794,24 +1126,31 @@ extension AppModel {
         gifSearchTask?.cancel()
         isLoadingGIFs = true
         gifErrorMessage = nil
+        let session = accountSession()
         gifSearchTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await Task.sleep(for: .milliseconds(300))
-                guard await provider.supports(.gifs) else {
+                try await Task.sleep(for: .milliseconds(250))
+                guard await session.provider.supports(.gifs),
+                      isCurrentAccountSession(session)
+                else {
                     throw ChatProviderError.capabilityDisabled(.gifs)
                 }
                 let values =
                     query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? try await provider.trendingGIFs()
-                        : try await provider.searchGIFs(query: query)
-                guard !Task.isCancelled else { return }
+                        ? try await session.provider.trendingGIFs()
+                        : try await session.provider.searchGIFs(query: query)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 gifResults = values
                 isLoadingGIFs = false
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 gifResults = []
                 gifErrorMessage = error.localizedDescription
                 isLoadingGIFs = false
@@ -819,13 +1158,84 @@ extension AppModel {
         }
     }
 
+    func loadGIFPicker() {
+        gifPickerLoadTask?.cancel()
+        gifPickerLoadGeneration &+= 1
+        let generation = gifPickerLoadGeneration
+        isLoadingGIFPicker = true
+        gifErrorMessage = nil
+        let session = accountSession()
+        gifPickerLoadTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if isCurrentAccountSession(session),
+                   gifPickerLoadGeneration == generation
+                {
+                    gifPickerLoadTask = nil
+                    isLoadingGIFPicker = false
+                }
+            }
+            do {
+                guard await session.provider.supports(.gifs),
+                      isCurrentAccountSession(session)
+                else {
+                    throw ChatProviderError.capabilityDisabled(.gifs)
+                }
+                async let landing = session.provider.gifPickerLanding()
+                async let favorites = session.provider.favoriteGIFs()
+                let (loadedLanding, loadedFavorites) = try await (landing, favorites)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      gifPickerLoadGeneration == generation
+                else { return }
+                gifCategories = loadedLanding.categories
+                gifTrendingPreviewURL = loadedLanding.trendingPreviewURL
+                favoriteGIFs = loadedFavorites
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      gifPickerLoadGeneration == generation
+                else { return }
+                gifErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func setGIFFavorite(_ gif: GIFSearchResult, isFavorite: Bool) {
+        guard gifFavoriteMutationURL == nil else { return }
+        gifFavoriteMutationURL = gif.url
+        let session = accountSession()
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if isCurrentAccountSession(session) {
+                    gifFavoriteMutationURL = nil
+                }
+            }
+            do {
+                let favorites = try await session.provider.setGIFFavorite(
+                    gif,
+                    isFavorite: isFavorite
+                )
+                guard isCurrentAccountSession(session) else { return }
+                favoriteGIFs = favorites
+            } catch {
+                guard isCurrentAccountSession(session) else { return }
+                gifErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
     @discardableResult
     func sendGIF(_ gif: GIFSearchResult) async -> Bool {
         guard selectedChannelID != nil else { return false }
+        let session = accountSession()
         let priorDraft = draft
         updateDraft(gif.url.absoluteString)
         let sent = await send()
-        if !sent {
+        if !sent, isCurrentAccountSession(session) {
             updateDraft(priorDraft)
         }
         return sent
@@ -833,30 +1243,58 @@ extension AppModel {
 
     func loadStickersIfNeeded(in guildID: GuildID) {
         guard stickersByGuild[guildID] == nil, stickerLoadTasks[guildID] == nil else { return }
+        let session = accountSession()
+        let generation = stickerLoadGeneration
         stickerLoadTasks[guildID] = Task { [weak self] in
             guard let self else { return }
-            defer { stickerLoadTasks[guildID] = nil }
-            guard await provider.supports(.stickers) else {
+            defer {
+                if self.isCurrentAccountSession(session),
+                   self.stickerLoadGeneration == generation
+                {
+                    self.stickerLoadTasks[guildID] = nil
+                }
+            }
+            guard await session.provider.supports(.stickers),
+                  self.isCurrentAccountSession(session),
+                  self.stickerLoadGeneration == generation,
+                  !Task.isCancelled
+            else {
+                guard self.isCurrentAccountSession(session),
+                      self.stickerLoadGeneration == generation,
+                      !Task.isCancelled
+                else { return }
                 stickersByGuild[guildID] = []
                 return
             }
-            stickersByGuild[guildID] = await (try? provider.stickers(in: guildID)) ?? []
+            let stickers = await (try? session.provider.stickers(in: guildID)) ?? []
+            guard self.isCurrentAccountSession(session),
+                  self.stickerLoadGeneration == generation,
+                  !Task.isCancelled
+            else { return }
+            stickersByGuild[guildID] = stickers
         }
     }
 
     @discardableResult
     func sendSticker(_ sticker: MessageSticker) async -> Bool {
-        guard let channelID = selectedChannelID, await provider.supports(.stickerSending) else {
+        let session = accountSession()
+        guard let channelID = selectedChannelID,
+              await session.provider.supports(.stickerSending),
+              isCurrentAccountSession(session)
+        else {
             return false
         }
         let draft = SendMessageDraft(channelID: channelID, content: "", stickerIDs: [sticker.id])
         do {
-            let message = try await provider.send(draft)
-            reconcile(message)
-            try await database?.save(messages: [message])
+            let message = try await session.provider.send(draft)
+            guard isCurrentAccountSession(session) else { return false }
+            let reconciled = reconcileVisibleOrCached(message)
+            journalAuthoritativeMessageUpsert(reconciled)
+            guard isCurrentAccountSession(session) else { return false }
             completeConversationReadingAndAdvance(channelID: channelID)
             return true
         } catch {
+            guard isCurrentAccountSession(session) else { return false }
             errorMessage = error.localizedDescription
             return false
         }
@@ -879,9 +1317,11 @@ extension AppModel {
         pendingComponentControls.insert(key)
         componentKeyByNonce[submission.nonce] = key
         componentErrors[key] = nil
+        let session = accountSession()
         do {
-            try await provider.submitComponentInteraction(submission)
+            try await session.provider.submitComponentInteraction(submission)
         } catch {
+            guard isCurrentAccountSession(session) else { return }
             pendingComponentControls.remove(key)
             componentKeyByNonce[submission.nonce] = nil
             componentErrors[key] = error.localizedDescription
@@ -903,14 +1343,17 @@ extension AppModel {
                 .remoteComponentChoices
             )
         }
-        return Array(
-            try await provider.componentChoices(
+        let session = accountSession()
+        let choices = try await session.provider.componentChoices(
                 kind: kind,
                 query: query,
                 guildID: guildID,
                 channelID: channelID
-            ).prefix(25)
-        )
+            )
+        guard isCurrentAccountSession(session) else {
+            throw CancellationError()
+        }
+        return Array(choices.prefix(25))
     }
 
     func isComponentPending(messageID: MessageID, customID: String) -> Bool {
@@ -934,14 +1377,17 @@ extension AppModel {
         guard let modal = presentedInteractionModal, let nonce = interactionModalNonce else {
             return false
         }
+        let session = accountSession()
         do {
-            try await provider.submitModal(
+            try await session.provider.submitModal(
                 ModalSubmission(customID: modal.customID, values: values, fileURLs: fileURLs),
                 nonce: nonce
             )
+            guard isCurrentAccountSession(session) else { return false }
             dismissInteractionModal()
             return true
         } catch {
+            guard isCurrentAccountSession(session) else { return false }
             interactionErrorMessage = error.localizedDescription
             return false
         }
@@ -990,8 +1436,9 @@ extension AppModel {
         // Count the attempt, not only a successful response. A failed mutation is
         // not immediately retried by subsequent keystrokes.
         lastTypingRequestAt[channelID] = .now
+        let session = accountSession()
         do {
-            try await provider.sendTyping(in: channelID)
+            try await session.provider.sendTyping(in: channelID)
         } catch is CancellationError {
             return
         } catch {
@@ -1123,32 +1570,72 @@ extension AppModel {
     }
 
     @discardableResult
+    func addPromisedComposerAttachments(
+        _ batch: ComposerPromisedFileBatch,
+        to destination: MessageComposerDestination
+    ) -> Bool {
+        let adoptedURLs = adoptPromisedFileBatch(batch)
+        let didHandle = addComposerAttachments(adoptedURLs, to: destination)
+        pruneOwnedPromisedAttachmentFiles()
+        return didHandle
+    }
+
+    func preparePromisedAttachmentsForImmediateSend(
+        _ batch: ComposerPromisedFileBatch,
+        to destination: MessageComposerDestination
+    ) -> [URL] {
+        let adoptedURLs = adoptPromisedFileBatch(batch)
+        guard isComposerDropEligible(destination) else {
+            pruneOwnedPromisedAttachmentFiles()
+            return []
+        }
+        let acceptedURLs = attachmentURLsWithinDiscordLimit(
+            adoptedURLs,
+            offeringExternalUploadFor: destination
+        )
+        let sentURLs = Array(
+            acceptedURLs.prefix(SendMessageDraft.maximumAttachmentCount)
+        )
+        if acceptedURLs.count > sentURLs.count {
+            errorMessage =
+                "You can attach up to \(SendMessageDraft.maximumAttachmentCount) files to one message."
+        }
+        beginUsingOwnedPromisedFiles(sentURLs)
+        pruneOwnedPromisedAttachmentFiles()
+        return sentURLs
+    }
+
+    @discardableResult
     func addComposerAttachments(
         _ urls: [URL],
         to destination: MessageComposerDestination
     ) -> Bool {
         guard isComposerDropEligible(destination), !urls.isEmpty else { return false }
+        let acceptedURLs = attachmentURLsWithinDiscordLimit(
+            urls,
+            offeringExternalUploadFor: destination
+        )
         var attachments = composerAttachments(for: destination)
-        var seen = Set(attachments.map(\.url.standardizedFileURL))
-        let unique = urls.filter { seen.insert($0.standardizedFileURL).inserted }
         let remaining = max(0, SendMessageDraft.maximumAttachmentCount - attachments.count)
         attachments.append(
-            contentsOf: unique.prefix(remaining).map { ForumPostAttachment(url: $0) }
+            contentsOf: acceptedURLs.prefix(remaining).map { ForumPostAttachment(url: $0) }
         )
         setComposerAttachments(attachments, for: destination)
-        if unique.count > remaining {
+        if acceptedURLs.count > remaining {
             errorMessage =
                 "You can attach up to \(SendMessageDraft.maximumAttachmentCount) files to one message."
         }
-        return remaining > 0 && !unique.isEmpty
+        // Claim a valid drop even when every file was rejected, preventing its path
+        // from being inserted into the text field by the system fallback.
+        return remaining > 0 || !urls.isEmpty
     }
 
     func removeComposerAttachment(
-        _ url: URL,
+        _ id: UUID,
         from destination: MessageComposerDestination
     ) {
         var attachments = composerAttachments(for: destination)
-        attachments.removeAll { $0.url.standardizedFileURL == url.standardizedFileURL }
+        attachments.removeAll { $0.id == id }
         setComposerAttachments(attachments, for: destination)
     }
 
@@ -1157,7 +1644,7 @@ extension AppModel {
         in destination: MessageComposerDestination
     ) {
         var attachments = composerAttachments(for: destination)
-        guard let index = attachments.firstIndex(where: { $0.url == attachment.url }) else {
+        guard let index = attachments.firstIndex(where: { $0.id == attachment.id }) else {
             return
         }
         attachments[index] = attachment
@@ -1165,11 +1652,11 @@ extension AppModel {
     }
 
     func toggleComposerAttachmentSpoiler(
-        _ url: URL,
+        _ id: UUID,
         in destination: MessageComposerDestination
     ) {
         var attachments = composerAttachments(for: destination)
-        guard let index = attachments.firstIndex(where: { $0.url == url }) else { return }
+        guard let index = attachments.firstIndex(where: { $0.id == id }) else { return }
         attachments[index].isSpoiler.toggle()
         setComposerAttachments(attachments, for: destination)
     }
@@ -1183,9 +1670,9 @@ extension AppModel {
         to destination: MessageComposerDestination
     ) {
         let current = composerAttachments(for: destination)
-        var seen = Set(current.map(\.url.standardizedFileURL))
+        var seen = Set(current.map(\.id))
         let restored = restoredAttachments.filter {
-            seen.insert($0.url.standardizedFileURL).inserted
+            seen.insert($0.id).inserted
         }
         setComposerAttachments(
             Array((restored + current).prefix(SendMessageDraft.maximumAttachmentCount)),
@@ -1233,6 +1720,7 @@ extension AppModel {
         case .thread:
             threadComposerAttachments = attachments
         }
+        pruneOwnedPromisedAttachmentFiles()
     }
 
     func validateAttachmentCount(_ attachments: [ForumPostAttachment]) -> Bool {
@@ -1266,6 +1754,7 @@ extension AppModel {
     }
 
     func performOutgoingSend(_ outgoing: SendMessageDraft, isRetry: Bool) async -> Bool {
+        let session = accountSession()
         Self.messageSendLogger.info(
             """
             Message send started channel=\(outgoing.channelID.description, privacy: .public) \
@@ -1274,22 +1763,12 @@ extension AppModel {
             """
         )
         do {
-            let confirmed = try await provider.send(outgoing)
-            reconcileVisibleOrCached(confirmed)
+            let confirmed = try await session.provider.send(outgoing)
+            guard isCurrentAccountSession(session) else { return false }
+            let reconciled = reconcileVisibleOrCached(confirmed)
             outgoingDraftsByNonce[outgoing.nonce] = nil
-            do {
-                try await database?.save(messages: [confirmed])
-            } catch {
-                let nsError = error as NSError
-                Self.messageSendLogger.warning(
-                    """
-                    Message sent but local persistence failed \
-                    channel=\(outgoing.channelID.description, privacy: .public) \
-                    message=\(confirmed.id.description, privacy: .public) \
-                    errorDomain=\(nsError.domain, privacy: .public) errorCode=\(nsError.code)
-                    """
-                )
-            }
+            journalAuthoritativeMessageUpsert(reconciled)
+            guard isCurrentAccountSession(session) else { return false }
             Self.messageSendLogger.info(
                 """
                 Message send succeeded channel=\(outgoing.channelID.description, privacy: .public) \
@@ -1299,6 +1778,7 @@ extension AppModel {
             )
             return true
         } catch {
+            guard isCurrentAccountSession(session) else { return false }
             let state: OutboxState
             if (error as? URLError)?.code == .timedOut {
                 state = .awaitingReconciliation
