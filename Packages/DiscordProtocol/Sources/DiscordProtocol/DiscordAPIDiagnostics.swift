@@ -7,6 +7,14 @@ import Foundation
 /// other user-authored strings that were deliberately discarded here.
 public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
     public static let shared = DiscordAPIDiagnosticStore()
+    public static let defaultMaximumDiskBytes = 64 * 1_024 * 1_024
+    public static let defaultMaximumDiskSessionFileCount = 4
+
+    private struct DiskCapture {
+        let fileURL: URL
+        let handle: FileHandle
+        var byteCount: Int
+    }
 
     private struct RetainedEntry {
         let entry: Entry
@@ -15,14 +23,20 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
 
     private struct State {
         var entries: [RetainedEntry?]
+        var capturesPayloadDetails: Bool
+        var diskCapture: DiskCapture?
+        var diskLoggingErrorDescription: String?
         var headIndex = 0
         var entryCount = 0
         var retainedEstimatedByteCount = 0
         var nextSequence: UInt64 = 1
         var droppedEntryCount = 0
 
-        init(capacity: Int) {
+        init(capacity: Int, capturesPayloadDetails: Bool) {
             entries = Array(repeating: nil, count: capacity)
+            self.capturesPayloadDetails = capturesPayloadDetails
+            diskCapture = nil
+            diskLoggingErrorDescription = nil
         }
 
         var orderedEntries: [Entry] {
@@ -106,6 +120,12 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         let redaction: String
     }
 
+    private struct DiskMetadata: Codable {
+        let format: String
+        let startedAt: Date
+        let redaction: String
+    }
+
     private struct EntrySizeComponents {
         let transport: String
         let direction: String
@@ -119,15 +139,45 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
 
     private let lock = NSLock()
     private let maximumRetainedBytes: Int
+    private let maximumDiskBytes: Int
+    private let maximumDiskSessionFileCount: Int
+    private let configuredDiskDirectoryURL: URL?
     private var state: State
 
     public init(
         maximumEntries: Int = 5_000,
-        maximumRetainedBytes: Int = 8 * 1_024 * 1_024
+        maximumRetainedBytes: Int = 8 * 1_024 * 1_024,
+        capturesPayloadDetails: Bool = false,
+        diskDirectoryURL: URL? = nil,
+        maximumDiskBytes: Int = defaultMaximumDiskBytes,
+        maximumDiskSessionFileCount: Int = defaultMaximumDiskSessionFileCount
     ) {
         let capacity = max(1, maximumEntries)
         self.maximumRetainedBytes = max(1, maximumRetainedBytes)
-        state = State(capacity: capacity)
+        self.maximumDiskBytes = max(1, maximumDiskBytes)
+        self.maximumDiskSessionFileCount = max(
+            1,
+            maximumDiskSessionFileCount
+        )
+        configuredDiskDirectoryURL = diskDirectoryURL
+        state = State(
+            capacity: capacity,
+            capturesPayloadDetails: capturesPayloadDetails
+        )
+    }
+
+    deinit {
+        try? state.diskCapture?.handle.close()
+    }
+
+    /// Detailed payload diagnostics deliberately default to off. Sanitizing a
+    /// large message or member response otherwise decodes and walks the same
+    /// payload a second time on every ordinary request. Route, status, timing,
+    /// rate-limit headers, and byte counts remain available in the lightweight
+    /// default mode.
+    public var capturesPayloadDetails: Bool {
+        get { withLock { $0.capturesPayloadDetails } }
+        set { withLock { $0.capturesPayloadDetails = newValue } }
     }
 
     public var retainedEntryCount: Int {
@@ -138,8 +188,77 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         withLock { $0.retainedEstimatedByteCount }
     }
 
+    public var savesDiagnosticsToDisk: Bool {
+        withLock { $0.diskCapture != nil }
+    }
+
+    public var currentDiskLogURL: URL? {
+        withLock { $0.diskCapture?.fileURL }
+    }
+
+    public var diskLoggingErrorDescription: String? {
+        withLock { $0.diskLoggingErrorDescription }
+    }
+
+    public var diskDirectoryURL: URL {
+        configuredDiskDirectoryURL ?? Self.defaultDiskDirectoryURL()
+    }
+
+    public func setSavesDiagnosticsToDisk(_ savesToDisk: Bool) throws {
+        try withLock { state in
+            state.diskLoggingErrorDescription = nil
+            if savesToDisk {
+                guard state.diskCapture == nil else { return }
+                do {
+                    state.diskCapture = try Self.makeDiskCapture(
+                        directoryURL: diskDirectoryURL,
+                        maximumBytes: maximumDiskBytes,
+                        maximumFileCount: maximumDiskSessionFileCount
+                    )
+                } catch {
+                    state.diskLoggingErrorDescription = String(
+                        reflecting: type(of: error)
+                    )
+                    throw error
+                }
+            } else if let capture = state.diskCapture {
+                state.diskCapture = nil
+                try capture.handle.close()
+            }
+        }
+    }
+
     public func clear() {
         withLock { $0.clear() }
+    }
+
+    /// Clears the in-memory ring and every managed session file. If disk
+    /// capture was active, it resumes in a fresh bounded file.
+    public func clearMemoryAndDisk() throws {
+        try withLock { state in
+            state.clear()
+            let resumesDiskCapture = state.diskCapture != nil
+            if let capture = state.diskCapture {
+                state.diskCapture = nil
+                try capture.handle.close()
+            }
+            do {
+                try Self.removeDiskCaptures(in: diskDirectoryURL)
+                if resumesDiskCapture {
+                    state.diskCapture = try Self.makeDiskCapture(
+                        directoryURL: diskDirectoryURL,
+                        maximumBytes: maximumDiskBytes,
+                        maximumFileCount: maximumDiskSessionFileCount
+                    )
+                }
+                state.diskLoggingErrorDescription = nil
+            } catch {
+                state.diskLoggingErrorDescription = String(
+                    reflecting: type(of: error)
+                )
+                throw error
+            }
+        }
     }
 
     public func recordHTTPRequest(
@@ -154,8 +273,8 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         if !query.isEmpty {
             object["query"] = .object(Self.sanitizedQuery(query))
         }
-        if let body, let payload = Self.sanitizedPayload(body) {
-            object["body"] = payload
+        if let body {
+            object["body"] = payloadForRetention(body)
         }
         append(
             transport: transport,
@@ -187,7 +306,7 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
             statusCode: response.statusCode,
             durationMilliseconds: Self.milliseconds(duration),
             headers: Self.sanitizedHeaders(response.allHeaderFields),
-            payload: Self.sanitizedPayload(body)
+            payload: payloadForRetention(body)
         )
     }
 
@@ -216,16 +335,23 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         direction: String,
         envelope: GatewayEnvelope
     ) {
+        var payload: [String: JSONValue] = [
+            "op": .number(Double(envelope.op)),
+            "sequence": envelope.sequence.map { .number(Double($0)) } ?? .null,
+            "event": envelope.eventName.map(JSONValue.string) ?? .null,
+        ]
+        if capturesPayloadDetails {
+            payload["data"] = Self.sanitize(
+                envelope.data ?? .null,
+                key: "data",
+                depth: 0
+            )
+        }
         append(
             transport: transport,
             direction: direction,
             operation: envelope.eventName ?? "opcode_\(envelope.op)",
-            payload: .object([
-                "op": .number(Double(envelope.op)),
-                "sequence": envelope.sequence.map { .number(Double($0)) } ?? .null,
-                "event": envelope.eventName.map(JSONValue.string) ?? .null,
-                "data": Self.sanitize(envelope.data ?? .null, key: "data", depth: 0),
-            ])
+            payload: .object(payload)
         )
     }
 
@@ -251,6 +377,15 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         direction: String,
         data: Data
     ) {
+        guard capturesPayloadDetails else {
+            append(
+                transport: transport,
+                direction: direction,
+                operation: "websocket_payload",
+                payload: Self.payloadSummary(data)
+            )
+            return
+        }
         let rawPayload = try? JSONDecoder().decode(JSONValue.self, from: data)
         let operation: String
         if case let .object(object)? = rawPayload,
@@ -270,6 +405,19 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         )
     }
 
+    public func recordWebSocketFailure(
+        transport: String,
+        direction: String,
+        error: any Error
+    ) {
+        append(
+            transport: transport,
+            direction: "\(direction)_failure",
+            operation: "websocket",
+            errorType: String(reflecting: type(of: error))
+        )
+    }
+
     public func exportData() throws -> Data {
         let snapshot = withLock { state in
             (
@@ -284,7 +432,7 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
 
         let metadata = ExportMetadata(
-            format: "sakuracord-discord-api-log-v1",
+            format: "sakuracord-discord-api-log-v2",
             generatedAt: .now,
             retainedEntryCount: snapshot.entries.count,
             retainedEstimatedByteCount:
@@ -292,7 +440,7 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
             droppedEntryCount: snapshot.droppedEntryCount,
             redaction:
                 "Sensitive values are discarded before retention. Message content, names, usernames, profile text, credentials, cookies, "
-                    + "challenge data, filenames, and URLs are not included. Snowflake IDs and protocol metadata may be included."
+                    + "challenge data, filenames, URLs, IDs, nonces, request IDs, and rate-limit bucket IDs are not included."
         )
         var result = try encoder.encode(metadata)
         result.append(0x0A)
@@ -308,6 +456,17 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
             return .object(["byte_count": .number(Double(data.count))])
         }
         return sanitize(value, key: nil, depth: 0)
+    }
+
+    private func payloadForRetention(_ data: Data) -> JSONValue {
+        guard capturesPayloadDetails else {
+            return Self.payloadSummary(data)
+        }
+        return Self.sanitizedPayload(data) ?? Self.payloadSummary(data)
+    }
+
+    private static func payloadSummary(_ data: Data) -> JSONValue {
+        .object(["byte_count": .number(Double(data.count))])
     }
 
     private func append(
@@ -341,7 +500,7 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
                 direction: direction,
                 operation: operation,
                 method: method,
-                path: path,
+                path: path.map(Self.sanitizedPath),
                 attempt: attempt,
                 statusCode: statusCode,
                 durationMilliseconds: durationMilliseconds,
@@ -355,14 +514,36 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
                 estimatedByteCount: estimatedByteCount,
                 maximumRetainedBytes: maximumRetainedBytes
             )
+            guard var capture = state.diskCapture else { return }
+            do {
+                let line = try Self.encodedJSONLine(entry)
+                guard capture.byteCount + line.count <= maximumDiskBytes else {
+                    try? capture.handle.close()
+                    state.diskCapture = nil
+                    state.diskLoggingErrorDescription =
+                        "Disk diagnostics reached the per-session size limit and stopped."
+                    return
+                }
+                try capture.handle.write(contentsOf: line)
+                capture.byteCount += line.count
+                state.diskCapture = capture
+            } catch {
+                try? capture.handle.close()
+                state.diskCapture = nil
+                state.diskLoggingErrorDescription = String(
+                    reflecting: type(of: error)
+                )
+            }
         }
     }
 
     @discardableResult
-    private func withLock<Result>(_ operation: (inout State) -> Result) -> Result {
+    private func withLock<Result>(
+        _ operation: (inout State) throws -> Result
+    ) rethrows -> Result {
         lock.lock()
         defer { lock.unlock() }
-        return operation(&state)
+        return try operation(&state)
     }
 
     private static let sensitiveKeys: Set<String> = [
@@ -399,15 +580,16 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         if let normalizedKey, sensitiveKeys.contains(normalizedKey) {
             return .string("<redacted>")
         }
+        if normalizedKey.map(isIDKey) == true || normalizedKey == "nonce" {
+            return .string("<redacted-id>")
+        }
         switch value {
         case let .object(object):
             return sanitizedObject(object, depth: depth)
         case let .array(values):
             return sanitizedArray(values, key: normalizedKey, depth: depth)
         case let .string(string):
-            let preservesString = normalizedKey.map(isIDKey) == true
-                || normalizedKey == "nonce"
-                || normalizedKey.map { safeStringKeys.contains($0) } == true
+            let preservesString = normalizedKey.map { safeStringKeys.contains($0) } == true
             if preservesString {
                 return .string(String(string.prefix(256)))
             }
@@ -424,8 +606,11 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         let retainedPairs = object.sorted { $0.key < $1.key }
             .prefix(maximumCollectionCount)
         var result: [String: JSONValue] = [:]
-        for pair in retainedPairs {
-            result[pair.key] = sanitize(
+        for (index, pair) in retainedPairs.enumerated() {
+            let retainedKey = isIdentifierString(pair.key)
+                ? "<redacted-id-key-\(index + 1)>"
+                : pair.key
+            result[retainedKey] = sanitize(
                 pair.value,
                 key: pair.key,
                 depth: depth + 1
@@ -465,10 +650,13 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         var result: [String: JSONValue] = [:]
         for item in query {
             let key = item.name.lowercased()
-            let preservesValue = isIDKey(key)
-                || ["before", "after", "around", "limit", "type", "with_counts"]
+            let isIdentifier = isIDKey(key)
+                || ["before", "after", "around"].contains(key)
+            let preservesValue = ["limit", "type", "with_counts"]
                     .contains(key)
-            if preservesValue {
+            if isIdentifier {
+                result[item.name] = .string("<redacted-id>")
+            } else if preservesValue {
                 result[item.name] = item.value.map(JSONValue.string) ?? .null
             } else {
                 result[item.name] = .string("<redacted>")
@@ -487,8 +675,37 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         return raw.reduce(into: [String: String]()) { result, pair in
             let name = String(describing: pair.key)
             guard allowed.contains(name.lowercased()) else { return }
-            result[name] = String(describing: pair.value).prefix(256).description
+            if ["x-request-id", "x-ratelimit-bucket"].contains(name.lowercased()) {
+                result[name] = "<redacted-id>"
+            } else {
+                result[name] = String(describing: pair.value).prefix(256).description
+            }
         }
+    }
+
+    private static func sanitizedPath(_ path: String) -> String {
+        let identifierChildCounts: [String: Int] = [
+            "applications": 1, "attachments": 1, "channels": 1,
+            "collectibles-products": 1, "guilds": 1, "invites": 1,
+            "messages": 1, "reactions": 1, "roles": 1, "users": 1,
+            "webhooks": 2,
+        ]
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        var redactedChildCount = 0
+        return segments.map { rawSegment in
+            let segment = String(rawSegment)
+            if redactedChildCount > 0 {
+                redactedChildCount -= 1
+                guard segment != "@me" else { return segment }
+                return "<redacted-id>"
+            }
+            redactedChildCount = identifierChildCounts[segment.lowercased()] ?? 0
+            return isIdentifierString(segment) ? "<redacted-id>" : segment
+        }.joined(separator: "/")
+    }
+
+    private static func isIdentifierString(_ value: String) -> Bool {
+        !value.isEmpty && (value.allSatisfy(\.isNumber) || UUID(uuidString: value) != nil)
     }
 
     private static func isIDKey(_ key: String) -> Bool {
@@ -544,5 +761,141 @@ public final class DiscordAPIDiagnosticStore: @unchecked Sendable {
         let seconds = components.seconds * 1_000
         let attoseconds = components.attoseconds / 1_000_000_000_000_000
         return Int(clamping: seconds + attoseconds)
+    }
+
+    private static func defaultDiskDirectoryURL() -> URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        return base
+            .appending(path: "SakuraCord", directoryHint: .isDirectory)
+            .appending(path: "Diagnostics", directoryHint: .isDirectory)
+    }
+
+    private static func makeDiskCapture(
+        directoryURL: URL,
+        maximumBytes: Int,
+        maximumFileCount: Int
+    ) throws -> DiskCapture {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: directoryURL.path
+        )
+        try pruneDiskCaptures(
+            in: directoryURL,
+            keepingExistingCount: max(0, maximumFileCount - 1)
+        )
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH-mm-ss"
+        let baseName = "SakuraCord Discord API Logs \(formatter.string(from: .now))"
+        var fileURL = directoryURL.appending(path: "\(baseName).jsonl")
+        var suffix = 2
+        while fileManager.fileExists(atPath: fileURL.path) {
+            fileURL = directoryURL.appending(path: "\(baseName)-\(suffix).jsonl")
+            suffix += 1
+        }
+        guard fileManager.createFile(
+            atPath: fileURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        let handle = try FileHandle(forWritingTo: fileURL)
+        do {
+            let metadata = DiskMetadata(
+                format: "sakuracord-discord-api-log-v2",
+                startedAt: .now,
+                redaction:
+                    "Sensitive and user-authored values, URLs, IDs, nonces, request IDs, and rate-limit bucket IDs are discarded before writing."
+            )
+            let line = try encodedJSONLine(metadata)
+            guard line.count <= maximumBytes else {
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+            try handle.write(contentsOf: line)
+            return DiskCapture(
+                fileURL: fileURL,
+                handle: handle,
+                byteCount: line.count
+            )
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: fileURL)
+            throw error
+        }
+    }
+
+    private static func pruneDiskCaptures(
+        in directoryURL: URL,
+        keepingExistingCount: Int
+    ) throws {
+        let files = try diskCaptureFiles(in: directoryURL)
+        let removalCount = max(0, files.count - keepingExistingCount)
+        for file in files.prefix(removalCount) {
+            try FileManager.default.removeItem(at: file.url)
+        }
+    }
+
+    private static func removeDiskCaptures(in directoryURL: URL) throws {
+        guard FileManager.default.fileExists(atPath: directoryURL.path) else {
+            return
+        }
+        for file in try diskCaptureFiles(in: directoryURL) {
+            try FileManager.default.removeItem(at: file.url)
+        }
+    }
+
+    private static func diskCaptureFiles(
+        in directoryURL: URL
+    ) throws -> [(url: URL, date: Date)] {
+        let keys: Set<URLResourceKey> = [
+            .contentModificationDateKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+        ]
+        return try FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        )
+        .compactMap { url -> (URL, Date)? in
+            guard url.lastPathComponent.hasPrefix(
+                "SakuraCord Discord API Logs "
+            ), url.pathExtension == "jsonl",
+                let values = try? url.resourceValues(forKeys: keys),
+                values.isRegularFile == true,
+                values.isSymbolicLink != true
+            else { return nil }
+            return (url, values.contentModificationDate ?? .distantPast)
+        }
+        .sorted {
+            if $0.1 == $1.1 {
+                return $0.0.lastPathComponent < $1.0.lastPathComponent
+            }
+            return $0.1 < $1.1
+        }
+    }
+
+    private static func encodedJSONLine<Value: Encodable>(
+        _ value: Value
+    ) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var data = try encoder.encode(value)
+        data.append(0x0A)
+        return data
     }
 }

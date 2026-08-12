@@ -3,61 +3,6 @@ import SakuraCordModels
 import SwiftUI
 import UniformTypeIdentifiers
 
-nonisolated struct ComposerDraftEdit: Equatable {
-    let text: String
-    let selection: NSRange
-}
-
-nonisolated enum ComposerPlaceholderPolicy {
-    static func text(
-        channelName: String,
-        channelKind: ChannelKindValue?,
-        destination: MessageComposerDestination
-    ) -> String {
-        if destination == .channel,
-           channelKind == .directMessage
-            || channelKind == .groupDirectMessage
-        {
-            return "Message @\(channelName)"
-        }
-        return "Message #\(channelName)"
-    }
-}
-
-nonisolated enum ComposerDraftEditing {
-    static func insert(_ insertedText: String, into source: String, replacing selection: NSRange?)
-        -> ComposerDraftEdit
-    {
-        let resolved = resolvedRange(selection, in: source)
-        var value = source
-        let range = Range(resolved, in: value) ?? (value.endIndex ..< value.endIndex)
-        value.replaceSubrange(range, with: insertedText)
-        return ComposerDraftEdit(
-            text: value,
-            selection: NSRange(location: resolved.location + insertedText.utf16.count, length: 0)
-        )
-    }
-
-    static func insertCustomEmoji(_ token: String, into source: String, replacing selection: NSRange?)
-        -> ComposerDraftEdit
-    {
-        insert(token, into: source, replacing: selection)
-    }
-
-    private static func resolvedRange(_ selection: NSRange?, in source: String) -> NSRange {
-        let end = NSRange(location: source.utf16.count, length: 0)
-        guard let selection,
-              selection.location != NSNotFound,
-              selection.location >= 0,
-              selection.length >= 0,
-              selection.location <= source.utf16.count,
-              selection.length <= source.utf16.count - selection.location,
-              Range(selection, in: source) != nil
-        else { return end }
-        return selection
-    }
-}
-
 struct ComposerView: View {
     typealias Conversation = MessageComposerDestination
 
@@ -66,11 +11,13 @@ struct ComposerView: View {
     var conversation: Conversation = .channel
     var onEditMessage: (MessageID) -> Void = { _ in }
     @State private var showFileImporter = false
+    @State private var showGIFPicker = false
     @State private var showEmojiPicker = false
     @State private var isFocused = false
     @State private var draftSelection: NSRange?
     @State private var selectionBeforeEmojiPicker: NSRange?
     @State private var isSubmitting = false
+    @State private var gifPickerDismissedAt: TimeInterval = -.infinity
     @State private var emojiPickerDismissedAt: TimeInterval = -.infinity
     @State private var autocompleteIndex = 0
     @State private var isAutocompleteDismissed = false
@@ -159,11 +106,11 @@ struct ComposerView: View {
                                     onEscape: handleEscapeCommand,
                                     onEditLatestMessage: editLatestMessage,
                                     onAutocompleteCommand: handleAutocomplete,
+                                    onPasteAttachments: addPastedAttachments,
                                     capturesUnfocusedTyping: true,
                                     selection: $draftSelection,
                                     isFocused: $isFocused
                                 )
-
                                 if draft.isEmpty {
                                     Text(composerPlaceholder)
                                         .foregroundStyle(.tertiary)
@@ -179,6 +126,27 @@ struct ComposerView: View {
                         }
                         HStack(spacing: 1) {
                             if !hasActiveCommand {
+                                if model.supportedCapabilities.contains(.gifs) {
+                                    ComposerActionButton(
+                                        systemImage: "rectangle.stack",
+                                        help: "Choose GIF",
+                                        iconSize: 18,
+                                        iconWeight: .medium
+                                    ) {
+                                        toggleGIFPicker()
+                                    }
+                                    .fixedSize()
+                                    .background {
+                                        StableReactionPickerPresenter(
+                                            isPresented: $showGIFPicker,
+                                            preferredEdge: .maxY,
+                                            accessibilityIdentifier: "composer-gif-picker"
+                                        ) {
+                                            composerGIFPicker
+                                        }
+                                        .frame(width: 36, height: 36)
+                                    }
+                                }
                                 ComposerActionButton(
                                     systemImage: "face.smiling.inverse",
                                     help: "Choose emoji",
@@ -245,7 +213,7 @@ struct ComposerView: View {
             guard case let .success(urls) = result else { return }
             if hasActiveCommand,
                let option = model.commandComposer.focusedOption, option.type == .attachment,
-               let url = urls.first
+               let url = urls.first, !model.attachmentURLsWithinDiscordLimit([url]).isEmpty
             {
                 model.commandComposer.setValue(
                     .attachment(url), displayText: url.lastPathComponent, for: option
@@ -255,12 +223,22 @@ struct ComposerView: View {
                 model.addComposerAttachments(urls, to: conversation)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .sakuracordFocusComposer)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .sakuracordFocusComposer)) { note in
+            if let destination = note.object as? MessageComposerDestination,
+               destination != conversation
+            {
+                return
+            }
             isFocused = true
         }
         .onChange(of: showEmojiPicker) { wasPresented, isPresented in
             if wasPresented, !isPresented {
                 emojiPickerDismissedAt = ProcessInfo.processInfo.systemUptime
+            }
+        }
+        .onChange(of: showGIFPicker) { wasPresented, isPresented in
+            if wasPresented, !isPresented {
+                gifPickerDismissedAt = ProcessInfo.processInfo.systemUptime
             }
         }
         .onChange(of: draft) { _, value in
@@ -288,6 +266,7 @@ struct ComposerView: View {
             draftSelection = nil
             selectionBeforeEmojiPicker = nil
             showFileImporter = false
+            showGIFPicker = false
             showEmojiPicker = false
             let isClosedVoiceChat = model.selectedChannel?.kind == .voice
                 && !model.isVoiceChatOpen
@@ -409,8 +388,21 @@ struct ComposerView: View {
         }
     }
 
+    private var composerGIFPicker: some View {
+        GIFPickerView(model: model) {
+            showGIFPicker = false
+            Task { @MainActor in
+                await Task.yield()
+                isFocused = true
+            }
+        }
+    }
+
     private func handleEscapeCommand() {
-        if showEmojiPicker {
+        guard !model.consumeEscapeForMediaViewer() else { return }
+        if showGIFPicker {
+            showGIFPicker = false
+        } else if showEmojiPicker {
             showEmojiPicker = false
         } else if let conversationID = activeConversationID {
             model.completeConversationReadingAndAdvance(
@@ -432,6 +424,20 @@ struct ComposerView: View {
             draftSelection
                 ?? NSRange(location: draft.utf16.count, length: 0)
         showEmojiPicker = true
+        showGIFPicker = false
+    }
+
+    private func toggleGIFPicker() {
+        if showGIFPicker {
+            showGIFPicker = false
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - gifPickerDismissedAt > 0.25 else { return }
+        showEmojiPicker = false
+        selectionBeforeEmojiPicker = nil
+        showGIFPicker = true
     }
 
     private func send() {
@@ -443,8 +449,12 @@ struct ComposerView: View {
         selectionBeforeEmojiPicker = nil
         let staged = attachments
         let conversationID = activeConversationID
+        model.beginUsingOwnedPromisedFiles(staged.map(\.url))
         model.clearComposerAttachments(for: conversation)
         Task {
+            defer {
+                model.endUsingOwnedPromisedFiles(staged.map(\.url))
+            }
             let scopedURLs = staged.map(\.url).filter {
                 $0.startAccessingSecurityScopedResource()
             }
@@ -911,7 +921,10 @@ struct ComposerView: View {
     }
 
     private var activeReply: Message? {
-        conversation == .channel ? model.replyingTo : nil
+        switch conversation {
+        case .channel: model.replyingTo
+        case .thread: model.threadReplyingTo
+        }
     }
 
     private var attachments: [ForumPostAttachment] {
@@ -935,18 +948,17 @@ struct ComposerView: View {
     }
 
     private func cancelReply() {
-        guard conversation == .channel else { return }
-        model.cancelReply()
+        model.cancelReply(in: conversation)
     }
 }
 
 private struct ComposerAttachmentTray: View {
     let attachments: [ForumPostAttachment]
-    let toggleSpoiler: (URL) -> Void
+    let toggleSpoiler: (UUID) -> Void
     let update: (ForumPostAttachment) -> Void
-    let remove: (URL) -> Void
-    @State private var hoveredURL: URL?
-    @State private var editingTarget: ForumAttachmentEditorTarget?
+    let remove: (UUID) -> Void
+    @State private var hoveredID: UUID?
+    @State private var editingTarget: ComposerAttachmentEditorTarget?
 
     private let tileSize: CGFloat = 230
     private let filenameRowHeight: CGFloat = 38
@@ -954,9 +966,9 @@ private struct ComposerAttachmentTray: View {
     var body: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 12) {
-                ForEach(attachments, id: \.url) { attachment in
+                ForEach(attachments) { attachment in
                     attachmentTile(attachment)
-                        .id(attachment.url)
+                        .id(attachment.id)
                 }
             }
             .padding(.horizontal, 14)
@@ -966,7 +978,7 @@ private struct ComposerAttachmentTray: View {
         .frame(height: tileSize + 28)
         .accessibilityLabel("Message attachments")
         .sheet(item: $editingTarget) { target in
-            if let attachment = attachments.first(where: { $0.url == target.id }) {
+            if let attachment = attachments.first(where: { $0.id == target.id }) {
                 ForumAttachmentEditor(
                     attachment: attachment,
                     cancel: { editingTarget = nil },
@@ -1004,7 +1016,7 @@ private struct ComposerAttachmentTray: View {
             }
             .frame(width: tileSize, height: tileSize - filenameRowHeight)
             .overlay(alignment: .topTrailing) {
-                if hoveredURL == attachment.url {
+                if hoveredID == attachment.id {
                     HoverActionPill(
                         glass: .regular.interactive(),
                         spacing: 1,
@@ -1017,7 +1029,7 @@ private struct ComposerAttachmentTray: View {
                             diameter: 22,
                             iconFont: .caption2.weight(.semibold)
                         ) {
-                            toggleSpoiler(attachment.url)
+                            toggleSpoiler(attachment.id)
                         }
                         HoverActionButton(
                             systemImage: "pencil",
@@ -1025,7 +1037,7 @@ private struct ComposerAttachmentTray: View {
                             diameter: 22,
                             iconFont: .caption2.weight(.semibold)
                         ) {
-                            editingTarget = ForumAttachmentEditorTarget(id: attachment.url)
+                            editingTarget = ComposerAttachmentEditorTarget(id: attachment.id)
                         }
                         HoverActionButton(
                             systemImage: "trash",
@@ -1034,7 +1046,7 @@ private struct ComposerAttachmentTray: View {
                             diameter: 22,
                             iconFont: .caption2.weight(.semibold)
                         ) {
-                            remove(attachment.url)
+                            remove(attachment.id)
                         }
                     }
                     .padding(7)
@@ -1061,10 +1073,10 @@ private struct ComposerAttachmentTray: View {
             }
             .contentShape(ConcentricRectangle(cornerRadius: 14, style: .continuous))
             .onHover { hovering in
-                hoveredURL =
+                hoveredID =
                     hovering
-                        ? attachment.url
-                        : (hoveredURL == attachment.url ? nil : hoveredURL)
+                        ? attachment.id
+                        : (hoveredID == attachment.id ? nil : hoveredID)
             }
             .help(attachment.filename)
             .accessibilityElement(children: .ignore)
@@ -1072,13 +1084,13 @@ private struct ComposerAttachmentTray: View {
             .accessibilityAction(
                 named: attachment.isSpoiler ? "Remove spoiler" : "Mark as spoiler"
             ) {
-                toggleSpoiler(attachment.url)
+                toggleSpoiler(attachment.id)
             }
             .accessibilityAction(named: "Edit attachment") {
-                editingTarget = ForumAttachmentEditorTarget(id: attachment.url)
+                editingTarget = ComposerAttachmentEditorTarget(id: attachment.id)
             }
             .accessibilityAction(named: "Delete attachment") {
-                remove(attachment.url)
+                remove(attachment.id)
             }
     }
 }
@@ -1912,82 +1924,6 @@ struct MentionAutocompleteList: View {
                     )
                 }
             }
-        }
-    }
-}
-
-private struct MentionAutocompleteRow: View {
-    let suggestion: MentionAutocompleteSuggestion
-    let isSelected: Bool
-    let select: () -> Void
-    let highlight: () -> Void
-
-    var body: some View {
-        Button(action: select) {
-            HStack(spacing: 9) {
-                leadingVisual
-                if suggestion.detail.isEmpty {
-                    Text(suggestion.title)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 12) {
-                            Text(suggestion.title)
-                                .foregroundStyle(.primary)
-                                .fixedSize(horizontal: true, vertical: false)
-                            Spacer(minLength: 8)
-                            Text(suggestion.detail)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-                        Text(suggestion.title)
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-            .padding(.horizontal, 9)
-            .frame(height: 40)
-            .background(
-                isSelected ? Color.primary.opacity(0.10) : .clear,
-                in: ConcentricRectangle(cornerRadius: 7, style: .continuous)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { if $0 { highlight() } }
-    }
-
-    @ViewBuilder
-    private var leadingVisual: some View {
-        switch suggestion.target {
-        case .unresolved:
-            EmptyView()
-        case .user:
-            AvatarView(name: suggestion.title, url: suggestion.avatarURL, size: 28)
-        case .role:
-            Circle()
-                .fill(Color(hex: suggestion.colorHex ?? 0x5865F2))
-                .frame(width: 16, height: 16)
-                .frame(width: 28, height: 28)
-        case .channel:
-            Image(systemName: suggestion.systemImage ?? "questionmark")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-        case .linkedChannel:
-            Image(systemName: ChannelIconPresentation.forumPostSystemImage)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
-        case .message:
-            Image(systemName: "bubble.left.fill")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
         }
     }
 }

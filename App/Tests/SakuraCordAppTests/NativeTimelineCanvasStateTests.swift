@@ -15,6 +15,7 @@ func `pointer state clears every hover and press target as one invariant`() {
     state.hoveredRow = 4
     state.hoveredCompactTimestampRow = 3
     state.hoveredComponentButton = component
+    state.hoveredForwardedSourceMessageID = messageID
     state.visualPressedComponentButton = component
     state.componentButtonPressProgress = 0.75
     state.componentButtonPressAnimationDestination = 1
@@ -28,7 +29,23 @@ func `pointer state clears every hover and press target as one invariant`() {
     #expect(cleared.row == 4)
     #expect(cleared.compactTimestampRow == 3)
     #expect(cleared.componentButton == component)
+    #expect(cleared.forwardedSourceMessageID == messageID)
     #expect(!state.hasHoverOrPressTargets)
+}
+
+@MainActor @Test
+func `forward overlay interaction block clears native hover and tracking state`() {
+    let canvas = NativeTimelineCanvasView(
+        frame: CGRect(x: 0, y: 0, width: 560, height: 400)
+    )
+    canvas.hoveredRow = 4
+    canvas.hoveredForwardedSourceMessageID = MessageID(rawValue: 72)
+
+    canvas.setOverlayInteractionBlocked(true)
+
+    #expect(canvas.overlayBlocksInteractions)
+    #expect(!canvas.pointer.hasHoverOrPressTargets)
+    #expect(canvas.rowTrackingAreas.isEmpty)
 }
 
 @MainActor @Test
@@ -56,6 +73,91 @@ func `editing session clear removes its overlay and all geometry`() {
     #expect(session.rowHeight == nil)
     #expect(session.overlayLocalFrame == nil)
     #expect(session.scrollSnapshot == nil)
+}
+
+@MainActor @Test
+func `active message picker keeps its originating action capsule`() throws {
+    let author = User(
+        id: UserID(rawValue: 700),
+        username: "fixture",
+        displayName: "Fixture"
+    )
+    let messages = [701, 702].map { rawID in
+        Message(
+            id: MessageID(rawValue: UInt64(rawID)),
+            channelID: ChannelID(rawValue: 703),
+            author: author,
+            content: "Message \(rawID)"
+        )
+    }
+    let items = messages.map { message in
+        NativeMessageTimelineItem.message(
+            MessageRowPresentation(
+                message: message,
+                startsGroup: true,
+                startsDay: false,
+                replyPreview: nil,
+                isReplyAvailable: false
+            ),
+            isUnreadBoundary: false,
+            isHighlighted: false
+        )
+    }
+    let layouts = items.map {
+        NativeTimelineRowLayout.make(item: $0, width: 560)
+    }
+    let storage = NativeTimelineCanvasStorage()
+    storage.items = items
+    storage.layouts = layouts
+    storage.rowOrigins = [0, layouts[0].height]
+    storage.contentHeight = layouts.reduce(0) { $0 + $1.height }
+    let canvas = NativeTimelineCanvasView(
+        frame: CGRect(x: 0, y: 0, width: 560, height: storage.contentHeight)
+    )
+    canvas.apply(
+        storage: storage,
+        model: AppModel(launchMode: .offlineTesting),
+        actions: NativeTimelineRowActions(
+            loadEarlier: {},
+            openReply: { _ in },
+            reply: nil,
+            retry: { _ in },
+            edit: { _, _ in },
+            markUnread: { _ in },
+            delete: { _ in },
+            react: { _, _ in },
+            openThread: { _ in },
+            submitComponent: { _, _, _, _ in }
+        ),
+        viewportWidth: 560,
+        minimumHeight: storage.contentHeight,
+        bottomSpacerHeight: 0,
+        contentOriginY: 0
+    )
+    let host = NativeTimelineActionCapsuleHost(rootView: AnyView(EmptyView()))
+    canvas.addSubview(host)
+    let state = NativeTimelineActionCapsuleState()
+    state.isReactionPickerPresented = true
+    canvas.actionCapsuleHost = host
+    canvas.actionCapsuleState = state
+    canvas.actionCapsuleMessageID = messages[0].id
+    canvas.actionCapsuleSize = NSSize(width: 100, height: 40)
+    canvas.hoveredRow = 0
+
+    canvas.reconcileActionCapsule()
+    let secondHighlight = try #require(layouts[1].highlightFrame)
+    let secondPoint = CGPoint(
+        x: secondHighlight.midX,
+        y: canvas.displayedRowOrigin(at: 1) + secondHighlight.midY
+    )
+    #expect(!canvas.actionCapsuleContains(secondPoint))
+    canvas.synchronizeHoveredRow(at: secondPoint)
+
+    #expect(canvas.hoveredRow == 1)
+    #expect(canvas.actionCapsuleMessageID == messages[0].id)
+    #expect(canvas.actionCapsuleHost === host)
+    #expect(host.superview === canvas)
+    canvas.removeActionCapsule()
 }
 
 @MainActor @Test

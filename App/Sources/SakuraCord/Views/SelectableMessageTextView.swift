@@ -114,6 +114,10 @@ struct SelectableMessageTextView: NSViewRepresentable {
     var model: AppModel?
     let source: String
     let emojiSize: CGFloat
+    var baseFontSize: CGFloat?
+    var maximumNumberOfLines: Int?
+    var isSelectable = true
+    var foregroundColor: NSColor?
     let mentionPresentations: [String: MentionPresentation]
     var onMentionClick: (MentionPresentation, StablePopoverAnchor) -> Void = { _, _ in }
     var onURLClick: (URL) -> Bool = { _ in false }
@@ -126,14 +130,14 @@ struct SelectableMessageTextView: NSViewRepresentable {
         let textView = RichMessageNSTextView()
         textView.delegate = context.coordinator
         textView.isEditable = false
-        textView.isSelectable = true
+        textView.isSelectable = isSelectable
         textView.isRichText = true
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
         textView.textContainer?.heightTracksTextView = false
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.lineBreakMode = .byWordWrapping
+        configureTextContainer(textView.textContainer)
         textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.linkTextAttributes = [
@@ -155,21 +159,37 @@ struct SelectableMessageTextView: NSViewRepresentable {
         textView.onMentionClick = onMentionClick
         textView.onURLClick = onURLClick
         textView.model = model
+        textView.isSelectable = isSelectable
+        configureTextContainer(textView.textContainer)
         let signature = RichMessageRenderSignature(
             source: source,
             emojiSize: emojiSize,
+            baseFontSize: baseFontSize,
+            maximumNumberOfLines: maximumNumberOfLines,
+            isSelectable: isSelectable,
+            foregroundColor: foregroundColor.map(String.init(describing:)),
             mentionPresentations: mentionPresentations
         )
         guard textView.renderSignature != signature else { return }
+        textView.clearHoveredLink()
         textView.invalidateMeasurementCache()
         textView.renderSignature = signature
-        textView.textStorage?.setAttributedString(
-            RichMessageAttributedText.make(
+        let rendered = NSMutableAttributedString(
+            attributedString: RichMessageAttributedText.make(
                 source: source,
                 emojiSize: emojiSize,
+                baseFontSize: baseFontSize,
                 mentionPresentations: mentionPresentations
             )
         )
+        if let foregroundColor {
+            rendered.addAttribute(
+                .foregroundColor,
+                value: foregroundColor,
+                range: NSRange(location: 0, length: rendered.length)
+            )
+        }
+        textView.textStorage?.setAttributedString(rendered)
         textView.invalidateIntrinsicContentSize()
         context.coordinator.loadEmojiImages(in: textView)
         context.coordinator.loadMentionAvatars(in: textView)
@@ -189,6 +209,13 @@ struct SelectableMessageTextView: NSViewRepresentable {
     static func dismantleNSView(_ nsView: RichMessageNSTextView, coordinator: Coordinator) {
         coordinator.cancelEmojiLoads()
         RichMessageSelectionOwnership.remove(nsView)
+    }
+
+    private func configureTextContainer(_ textContainer: NSTextContainer?) {
+        textContainer?.maximumNumberOfLines = maximumNumberOfLines ?? 0
+        textContainer?.lineBreakMode = maximumNumberOfLines == nil
+            ? .byWordWrapping
+            : .byTruncatingTail
     }
 
     @MainActor
@@ -245,6 +272,10 @@ nonisolated enum RichMessageTextMeasurement {
 private struct RichMessageRenderSignature: Equatable {
     let source: String
     let emojiSize: CGFloat
+    let baseFontSize: CGFloat?
+    let maximumNumberOfLines: Int?
+    let isSelectable: Bool
+    let foregroundColor: String?
     let mentionPresentations: [String: MentionPresentation]
 }
 
@@ -288,11 +319,13 @@ nonisolated enum RichMessageAttributedText {
     static func make(
         source: String,
         emojiSize: CGFloat,
+        baseFontSize: CGFloat? = nil,
         mentionPresentations: [String: MentionPresentation]
     ) -> NSAttributedString {
         make(
             prepared: prepare(source: source),
             emojiSize: emojiSize,
+            baseFontSize: baseFontSize,
             mentionPresentations: mentionPresentations
         )
     }
@@ -301,14 +334,15 @@ nonisolated enum RichMessageAttributedText {
     static func make(
         prepared: Prepared,
         emojiSize: CGFloat,
+        baseFontSize: CGFloat? = nil,
         mentionPresentations: [String: MentionPresentation]
     ) -> NSAttributedString {
-        let baseFontSize: CGFloat = prepared.isEmojiOnly ? emojiSize : 15
-        let baseFont = NSFont.systemFont(ofSize: baseFontSize)
+        let resolvedBaseFontSize = baseFontSize ?? (prepared.isEmojiOnly ? emojiSize : 15)
+        let baseFont = NSFont.systemFont(ofSize: resolvedBaseFontSize)
         let output = NSMutableAttributedString(
             attributedString: DiscordMarkdown.appKitAttributed(
                 prepared.markdownPlan,
-                baseFontSize: baseFontSize
+                baseFontSize: resolvedBaseFontSize
             )
         )
         let placeholderRanges = ranges(of: "\u{FFFC}", in: output.string)
@@ -406,6 +440,7 @@ final class RichMessageNSTextView: NSTextView {
     var onMentionClick: (MentionPresentation, StablePopoverAnchor) -> Void = { _, _ in }
     var onURLClick: (URL) -> Bool = { _ in false }
     private var hoveredMentionLocation: Int?
+    private var hoveredLinkRange: NSRange?
     private var mentionTrackingArea: NSTrackingArea?
     private var unconstrainedMeasurement: CGSize?
     private var measuredHeights: [CGFloat: CGFloat] = [:]
@@ -488,17 +523,21 @@ final class RichMessageNSTextView: NSTextView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        updateHoveredMention(at: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        updateHoveredMention(at: point)
+        setHoveredLink(link(at: point)?.range)
         super.mouseMoved(with: event)
     }
 
     override func mouseExited(with event: NSEvent) {
         setHoveredMention(nil)
+        clearHoveredLink()
         super.mouseExited(with: event)
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        if mentionAttachment(at: convert(event.locationInWindow, from: nil)) == nil {
+        let point = convert(event.locationInWindow, from: nil)
+        if mentionAttachment(at: point) == nil, link(at: point) == nil {
             NSCursor.iBeam.set()
         } else {
             NSCursor.pointingHand.set()
@@ -530,6 +569,62 @@ final class RichMessageNSTextView: NSTextView {
               as? MentionTextAttachment
         else { return nil }
         return (index, attachment)
+    }
+
+    private func link(at point: NSPoint) -> (url: URL, range: NSRange)? {
+        guard let layoutManager, let textContainer,
+              attributedString().length > 0
+        else { return nil }
+        var location = point
+        location.x -= textContainerOrigin.x
+        location.y -= textContainerOrigin.y
+        let glyph = layoutManager.glyphIndex(for: location, in: textContainer)
+        let index = layoutManager.characterIndexForGlyph(at: glyph)
+        guard index < attributedString().length else { return nil }
+        var range = NSRange(location: 0, length: 0)
+        let rawLink = attributedString().attribute(
+            .link,
+            at: index,
+            effectiveRange: &range
+        )
+        let url: URL? = switch rawLink {
+        case let value as URL:
+            value
+        case let value as NSURL:
+            value as URL
+        case let value as String:
+            URL(string: value)
+        default:
+            nil
+        }
+        guard let url, range.length > 0 else { return nil }
+        return (url, range)
+    }
+
+    fileprivate func clearHoveredLink() {
+        setHoveredLink(nil)
+    }
+
+    private func setHoveredLink(_ range: NSRange?) {
+        if let hoveredLinkRange, let range,
+           NSEqualRanges(hoveredLinkRange, range)
+        {
+            return
+        }
+        if let hoveredLinkRange {
+            layoutManager?.removeTemporaryAttribute(
+                .underlineStyle,
+                forCharacterRange: hoveredLinkRange
+            )
+        }
+        hoveredLinkRange = range
+        if let range {
+            layoutManager?.addTemporaryAttribute(
+                .underlineStyle,
+                value: NSUnderlineStyle.single.rawValue,
+                forCharacterRange: range
+            )
+        }
     }
 
     func mentionPopoverAnchor(at index: Int, rawToken: String) -> StablePopoverAnchor? {

@@ -12,6 +12,16 @@ import Testing
     #expect(NativeHoverPopoverPolicy.usesIntrinsicContentSize)
 }
 
+@MainActor
+@Test func `member profile popovers stabilize their size before animating`() {
+    #expect(StablePopoverConfiguration.memberProfile.animates)
+    #expect(StablePopoverConfiguration.memberProfile.stabilizesInitialContentSize)
+    #expect(
+        StablePopoverConfiguration.memberProfile.dismissalBehavior
+            == .outsideSourceView
+    )
+}
+
 @Test func `stable hover placement chooses an edge that fits before presentation`() {
     let screen = CGRect(x: 0, y: 0, width: 1_000, height: 800)
     let content = CGSize(width: 240, height: 110)
@@ -410,6 +420,30 @@ import Testing
         == "reaction-picker-inline")
     #expect(ReactionActionMenuPresentation.toolbar.pickerAccessibilityIdentifier
         == "reaction-picker-toolbar")
+}
+
+@MainActor
+@Test func `reaction picker snapshot never becomes a child of the window content root`() throws {
+    let window = NSWindow(
+        contentRect: CGRect(x: 40, y: 40, width: 320, height: 160),
+        styleMask: [.borderless],
+        backing: .buffered,
+        defer: false
+    )
+    let contentView = NSView(frame: window.contentLayoutRect)
+    let sourceView = StableReactionPickerSourceView(
+        frame: CGRect(x: 180, y: 80, width: 36, height: 36)
+    )
+    contentView.addSubview(sourceView)
+    window.contentView = contentView
+    window.orderFrontRegardless()
+    defer { window.orderOut(nil) }
+
+    let snapshot = sourceView.installSnapshotAnchor(in: window)
+    let contentContainer = try #require(contentView.superview)
+
+    #expect(snapshot.superview === contentContainer)
+    #expect(snapshot.superview !== contentView)
 }
 
 @Test func `visible reaction preview loading is stable and skips known reactors`() {

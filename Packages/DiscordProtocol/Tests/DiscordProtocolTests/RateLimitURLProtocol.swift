@@ -1,9 +1,38 @@
 import Foundation
 
 final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var totalRequestCount = 0
     nonisolated(unsafe) static var guildListAttempts = 0
+    nonisolated(unsafe) static var guildListJSON =
+        #"[{"id":"100","name":"Guild","icon":null,"owner":false,"permissions":"1024"}]"#
+    nonisolated(unsafe) static var currentUserRequests = 0
+    nonisolated(unsafe) static var apexInstallationRequests = 0
+    nonisolated(unsafe) static var apexInstallationQuery: [String: String] = [:]
+    nonisolated(unsafe) static var apexInstallationMethod: String?
+    nonisolated(unsafe) static var apexInstallationHost: String?
+    nonisolated(unsafe) static var apexInstallationReferer: String?
+    nonisolated(unsafe) static var apexInstallationAuthorization: String?
+    nonisolated(unsafe) static var apexInstallationHeader: String?
+    nonisolated(unsafe) static var apexInstallationFingerprint: String?
+    nonisolated(unsafe) static var apexInstallationSuperProperties: String?
+    nonisolated(unsafe) static var apexInstallationHadBody = false
+    nonisolated(unsafe) static var apexOmitsInstallation = false
+    nonisolated(unsafe) static var loginExperimentsRequests = 0
+    nonisolated(unsafe) static var loginExperimentsQuery: [String: String] = [:]
+    nonisolated(unsafe) static var loginExperimentsMethod: String?
+    nonisolated(unsafe) static var loginExperimentsHost: String?
+    nonisolated(unsafe) static var loginExperimentsReferer: String?
+    nonisolated(unsafe) static var loginExperimentsContext: String?
+    nonisolated(unsafe) static var loginExperimentsAuthorization: String?
+    nonisolated(unsafe) static var loginExperimentsInstallationHeader: String?
+    nonisolated(unsafe) static var loginExperimentsFingerprint: String?
+    nonisolated(unsafe) static var loginExperimentsSuperProperties: String?
+    nonisolated(unsafe) static var loginExperimentsHadBody = false
     nonisolated(unsafe) static var privateChannelListRequests = 0
     nonisolated(unsafe) static var guildChannelRequests = 0
+    nonisolated(unsafe) static var guildRoleRequests = 0
+    nonisolated(unsafe) static var guildEmojiRequests = 0
+    nonisolated(unsafe) static var emojiSettingsRequests = 0
     nonisolated(unsafe) static var sentNonce: String?
     nonisolated(unsafe) static var sentEnforceNonce = false
     nonisolated(unsafe) static var uploadHadAuthorization = false
@@ -22,6 +51,7 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var restrictMessageSend = false
     nonisolated(unsafe) static var forbidMemberSearch = false
     nonisolated(unsafe) static var unauthorizeMemberSearch = false
+    nonisolated(unsafe) static var unavailableProfileRequestCount = 0
     nonisolated(unsafe) static var settingsRequestCount = 0
     nonisolated(unsafe) static var settingsMethod: String?
     nonisolated(unsafe) static var guildCommandIndexRequests = 0
@@ -37,6 +67,14 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var ackPath: String?
     nonisolated(unsafe) static var ackBody: [String: Any]?
     nonisolated(unsafe) static var ackStatus = 200
+    nonisolated(unsafe) static var bulkAckRequestCount = 0
+    nonisolated(unsafe) static var bulkAckMethods: [String] = []
+    nonisolated(unsafe) static var bulkAckBodies: [[String: Any]] = []
+    nonisolated(unsafe) static var bulkAckStatuses: [Int] = []
+    nonisolated(unsafe) static var guildNotificationRequestCount = 0
+    nonisolated(unsafe) static var guildNotificationMethod: String?
+    nonisolated(unsafe) static var guildNotificationBody: [String: Any]?
+    nonisolated(unsafe) static var guildNotificationStatus = 200
     nonisolated(unsafe) static var channelNotificationRequestCount = 0
     nonisolated(unsafe) static var channelNotificationMethod: String?
     nonisolated(unsafe) static var channelNotificationPath: String?
@@ -50,9 +88,38 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var reactionMethods: [String] = []
 
     static func reset() {
+        totalRequestCount = 0
         guildListAttempts = 0
+        guildListJSON =
+            #"[{"id":"100","name":"Guild","icon":null,"owner":false,"permissions":"1024"}]"#
+        currentUserRequests = 0
+        apexInstallationRequests = 0
+        apexInstallationQuery = [:]
+        apexInstallationMethod = nil
+        apexInstallationHost = nil
+        apexInstallationReferer = nil
+        apexInstallationAuthorization = nil
+        apexInstallationHeader = nil
+        apexInstallationFingerprint = nil
+        apexInstallationSuperProperties = nil
+        apexInstallationHadBody = false
+        apexOmitsInstallation = false
+        loginExperimentsRequests = 0
+        loginExperimentsQuery = [:]
+        loginExperimentsMethod = nil
+        loginExperimentsHost = nil
+        loginExperimentsReferer = nil
+        loginExperimentsContext = nil
+        loginExperimentsAuthorization = nil
+        loginExperimentsInstallationHeader = nil
+        loginExperimentsFingerprint = nil
+        loginExperimentsSuperProperties = nil
+        loginExperimentsHadBody = false
         privateChannelListRequests = 0
         guildChannelRequests = 0
+        guildRoleRequests = 0
+        guildEmojiRequests = 0
+        emojiSettingsRequests = 0
         sentNonce = nil
         sentEnforceNonce = false
         uploadHadAuthorization = false
@@ -71,6 +138,7 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
         restrictMessageSend = false
         forbidMemberSearch = false
         unauthorizeMemberSearch = false
+        unavailableProfileRequestCount = 0
         settingsRequestCount = 0
         settingsMethod = nil
         guildCommandIndexRequests = 0
@@ -86,6 +154,14 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
         ackPath = nil
         ackBody = nil
         ackStatus = 200
+        bulkAckRequestCount = 0
+        bulkAckMethods = []
+        bulkAckBodies = []
+        bulkAckStatuses = []
+        guildNotificationRequestCount = 0
+        guildNotificationMethod = nil
+        guildNotificationBody = nil
+        guildNotificationStatus = 200
         channelNotificationRequestCount = 0
         channelNotificationMethod = nil
         channelNotificationPath = nil
@@ -120,7 +196,73 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
         let status: Int
         let json: String
         switch path {
+        case "/api/v9/apex/experiments":
+            RateLimitURLProtocol.apexInstallationRequests += 1
+            RateLimitURLProtocol.apexInstallationQuery = Dictionary(
+                uniqueKeysWithValues: (URLComponents(
+                    url: request.url!,
+                    resolvingAgainstBaseURL: false
+                )?.queryItems ?? []).compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }
+            )
+            RateLimitURLProtocol.apexInstallationAuthorization = request.value(
+                forHTTPHeaderField: "Authorization"
+            )
+            RateLimitURLProtocol.apexInstallationMethod = request.httpMethod
+            RateLimitURLProtocol.apexInstallationHost = request.url?.host
+            RateLimitURLProtocol.apexInstallationReferer = request.value(
+                forHTTPHeaderField: "Referer"
+            )
+            RateLimitURLProtocol.apexInstallationHeader = request.value(
+                forHTTPHeaderField: "X-Installation-ID"
+            )
+            RateLimitURLProtocol.apexInstallationFingerprint = request.value(
+                forHTTPHeaderField: "X-Fingerprint"
+            )
+            RateLimitURLProtocol.apexInstallationSuperProperties = request.value(
+                forHTTPHeaderField: "X-Super-Properties"
+            )
+            RateLimitURLProtocol.apexInstallationHadBody = request.httpBody?.isEmpty == false
+            status = 200
+            json = RateLimitURLProtocol.apexOmitsInstallation
+                ? #"{"assignments":{}}"#
+                : #"{"installation":"server-issued-installation","assignments":{}}"#
+        case "/api/v9/experiments":
+            RateLimitURLProtocol.loginExperimentsRequests += 1
+            RateLimitURLProtocol.loginExperimentsQuery = Dictionary(
+                uniqueKeysWithValues: (URLComponents(
+                    url: request.url!,
+                    resolvingAgainstBaseURL: false
+                )?.queryItems ?? []).compactMap { item in
+                    item.value.map { (item.name, $0) }
+                }
+            )
+            RateLimitURLProtocol.loginExperimentsMethod = request.httpMethod
+            RateLimitURLProtocol.loginExperimentsHost = request.url?.host
+            RateLimitURLProtocol.loginExperimentsReferer = request.value(
+                forHTTPHeaderField: "Referer"
+            )
+            RateLimitURLProtocol.loginExperimentsContext = request.value(
+                forHTTPHeaderField: "X-Context-Properties"
+            )
+            RateLimitURLProtocol.loginExperimentsAuthorization = request.value(
+                forHTTPHeaderField: "Authorization"
+            )
+            RateLimitURLProtocol.loginExperimentsInstallationHeader = request.value(
+                forHTTPHeaderField: "X-Installation-ID"
+            )
+            RateLimitURLProtocol.loginExperimentsFingerprint = request.value(
+                forHTTPHeaderField: "X-Fingerprint"
+            )
+            RateLimitURLProtocol.loginExperimentsSuperProperties = request.value(
+                forHTTPHeaderField: "X-Super-Properties"
+            )
+            RateLimitURLProtocol.loginExperimentsHadBody = request.httpBody?.isEmpty == false
+            status = 200
+            json = #"{"fingerprint":"server-issued-fingerprint","installation":"fallback-installation","assignments":[],"guild_experiments":[]}"#
         case "/api/v9/users/@me":
+            RateLimitURLProtocol.currentUserRequests += 1
             status = 200
             json = #"{"id":"1","username":"tester","global_name":"Tester","avatar":null}"#
         case "/api/v9/users/@me/guilds":
@@ -130,7 +272,7 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
                 json = #"{"retry_after":0.01,"global":false}"#
             } else {
                 status = 200
-                json = #"[{"id":"100","name":"Guild","icon":null,"owner":false,"permissions":"1024"}]"#
+                json = RateLimitURLProtocol.guildListJSON
             }
         case "/api/v9/users/@me/channels":
             RateLimitURLProtocol.privateChannelListRequests += 1
@@ -150,11 +292,20 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
             "position":2,"permission_overwrites":[]}]
             """#
         case "/api/v9/guilds/100/roles":
+            RateLimitURLProtocol.guildRoleRequests += 1
             status = 200
             json = #"""
             [{"id":"100","name":"@everyone","position":0,"hoist":false,"color":0,"permissions":"1024"},
             {"id":"101","name":"Design","position":2,"hoist":true,"color":5793266,"permissions":"0"}]
             """#
+        case "/api/v9/guilds/987654321012345678/emojis":
+            RateLimitURLProtocol.guildEmojiRequests += 1
+            status = 200
+            json = "[]"
+        case "/api/v9/users/@me/settings-proto/2":
+            RateLimitURLProtocol.emojiSettingsRequests += 1
+            status = 200
+            json = #"{"settings":""}"#
         case "/api/v9/guilds/100/members/search":
             RateLimitURLProtocol.memberSearchRequestCount += 1
             let items = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems
@@ -170,6 +321,11 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
                 status = 200
                 json = #"[{"member":{"user":{"id":"2","username":"maya","global_name":"Maya","avatar":null},"nick":"Maya","roles":["101"]}}]"#
             }
+        case "/api/v9/users/111111111111111111/profile",
+             "/api/v9/users/222222222222222222/profile":
+            RateLimitURLProtocol.unavailableProfileRequestCount += 1
+            status = 404
+            json = #"{"message":"Unknown User","code":10013}"#
         case "/api/v9/guilds/100/application-command-index":
             RateLimitURLProtocol.guildCommandIndexRequests += 1
             status = 200
@@ -215,6 +371,30 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
             json =
                 status == 200
                 ? #"{"token":"next-token"}"#
+                : #"{"retry_after":0.01,"global":false}"#
+        case "/api/v9/read-states/ack-bulk":
+            RateLimitURLProtocol.bulkAckRequestCount += 1
+            RateLimitURLProtocol.bulkAckMethods.append(request.httpMethod ?? "")
+            if let body = RateLimitURLProtocol.requestBody(request),
+               let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+            {
+                RateLimitURLProtocol.bulkAckBodies.append(object)
+            }
+            let requestIndex = RateLimitURLProtocol.bulkAckRequestCount - 1
+            status = RateLimitURLProtocol.bulkAckStatuses.indices.contains(requestIndex)
+                ? RateLimitURLProtocol.bulkAckStatuses[requestIndex] : 204
+            json = status == 204 ? "" : #"{"message":"Synthetic rejection"}"#
+        case "/api/v9/users/@me/guilds/settings":
+            RateLimitURLProtocol.guildNotificationRequestCount += 1
+            RateLimitURLProtocol.guildNotificationMethod = request.httpMethod
+            RateLimitURLProtocol.guildNotificationBody =
+                RateLimitURLProtocol.requestBody(request).flatMap {
+                    try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
+                }
+            status = RateLimitURLProtocol.guildNotificationStatus
+            json =
+                status == 200
+                ? #"[{"guild_id":"100"}]"#
                 : #"{"retry_after":0.01,"global":false}"#
         case "/api/v9/users/@me/guilds/100/settings",
              "/api/v9/users/@me/guilds/@me/settings":
@@ -345,6 +525,7 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func startLoading() {
+        Self.totalRequestCount += 1
         let stub = StubResponseBuilder(request: request).response
         let status = stub.status
         let json = stub.json
@@ -358,14 +539,16 @@ final class RateLimitURLProtocol: URLProtocol, @unchecked Sendable {
 
     override func stopLoading() {}
 
-    private static func guildFolderSettingsProto() -> Data {
+    static func guildFolderSettingsProto(guildIDs orderedGuildIDs: [UInt64] = [100]) -> Data {
         func field(_ number: Int, payload: [UInt8]) -> [UInt8] {
             encodeProtoVarint(UInt64(number << 3 | 2)) + encodeProtoVarint(UInt64(payload.count)) + payload
         }
-        let fixedGuildID = (0 ..< 8).map {
-            UInt8(truncatingIfNeeded: UInt64(100) >> UInt64($0 * 8))
+        let fixedGuildIDs = orderedGuildIDs.flatMap { guildID in
+            (0 ..< 8).map {
+                UInt8(truncatingIfNeeded: guildID >> UInt64($0 * 8))
+            }
         }
-        let guildIDs = field(1, payload: fixedGuildID)
+        let guildIDs = field(1, payload: fixedGuildIDs)
         let folderID = field(2, payload: encodeProtoVarint(1 << 3) + encodeProtoVarint(42))
         let name = field(3, payload: field(1, payload: Array("Work".utf8)))
         let color = field(4, payload: encodeProtoVarint(1 << 3) + encodeProtoVarint(0x58_65_F2))

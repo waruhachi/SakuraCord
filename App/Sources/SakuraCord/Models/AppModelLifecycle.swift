@@ -12,6 +12,22 @@ import SakuraCordPersistence
 import UniformTypeIdentifiers
 import UserNotifications
 
+nonisolated enum RestoredCredentialSelectionPolicy {
+    static func handle(
+        from handles: [CredentialHandle],
+        preferredAccountID: String?
+    ) -> CredentialHandle? {
+        if let preferredAccountID,
+           let preferred = handles.first(where: {
+               $0.accountID == preferredAccountID
+           })
+        {
+            return preferred
+        }
+        return handles.first
+    }
+}
+
 extension AppModel {
     var isOfflineTesting: Bool {
         launchMode == .offlineTesting
@@ -19,6 +35,42 @@ extension AppModel {
 
     var isDiscordNetworkingDisabled: Bool {
         discordNetworkDisabled
+    }
+
+    func refreshSavedAccounts() async {
+        guard launchMode == .normal else {
+            savedAccounts = []
+            return
+        }
+        do {
+            let handles = try await credentialStore.handles()
+            savedAccounts = await savedAccountStore.accounts(matching: handles)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func switchAccount(to accountID: String) async -> Bool {
+        guard accountID != activeAccountID else { return true }
+        let preservesWorkspace = sessionState == .workspace
+        isSwitchingAccounts = true
+        defer { isSwitchingAccounts = false }
+        do {
+            let handles = try await credentialStore.handles()
+            guard let handle = handles.first(where: { $0.accountID == accountID }) else {
+                savedAccounts.removeAll { $0.accountID == accountID }
+                await savedAccountStore.remove(accountID: accountID)
+                errorMessage = "That saved Discord account is no longer available."
+                return false
+            }
+            return await connectAuthenticatedAccount(
+                handle,
+                preservesInteractivePresentation: preservesWorkspace
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
     }
 
     func connectAuthenticatedAccount(
@@ -29,10 +81,88 @@ extension AppModel {
             errorMessage = "Discord networking is disabled in offline UI mode."
             return false
         }
-        await leaveVoice()
-        resetAppSounds()
-        await provider.disconnect()
-        eventTask?.cancel()
+        guard await accountTransitionCoordinator.acquireIfAvailable() else { return false }
+        accountTransitionIsActive = true
+        let installationID = await AppPerformanceSignposts.measure("InstallationRestore") {
+            await UserDefaultsDiscordFingerprintStore.shared.loadInstallationID()
+        }
+        guard !Task.isCancelled else {
+            accountTransitionIsActive = false
+            await accountTransitionCoordinator.release()
+            return false
+        }
+        let nextProvider = AppPerformanceSignposts.measureSync("ProviderCreation") {
+            authenticatedProviderFactory(handle, installationID)
+        }
+        await nextProvider.updateClientAppState(isFocused: mainWindowIsActive)
+        do {
+            // Enumerating Keychain item attributes reveals the account handle
+            // without necessarily authorizing access to its secret. Preparing
+            // the provider retains that value for bootstrap, avoiding a second
+            // Keychain prompt after a one-time authorization.
+            try await nextProvider.prepareAuthentication()
+        } catch {
+            errorMessage = error.localizedDescription
+            accountTransitionIsActive = false
+            if !isAuthenticated {
+                sessionState = .signedOut
+            }
+            await accountTransitionCoordinator.release()
+            return false
+        }
+        guard !Task.isCancelled else {
+            accountTransitionIsActive = false
+            await accountTransitionCoordinator.release()
+            return false
+        }
+        invalidateAccountSession()
+        let transitionGeneration = accountSessionGeneration
+        let connected = await performAuthenticatedAccountConnection(
+            handle,
+            provider: nextProvider,
+            preservesInteractivePresentation: preservesInteractivePresentation,
+            transitionGeneration: transitionGeneration
+        )
+        accountTransitionIsActive = false
+        await accountTransitionCoordinator.release()
+        return connected
+    }
+
+    func performAuthenticatedAccountConnection(
+        _ handle: CredentialHandle,
+        provider nextProvider: any ChatProvider,
+        preservesInteractivePresentation: Bool,
+        transitionGeneration: UInt64
+    ) async -> Bool {
+        let previousAccount = accountSession(allowsTransition: true)
+        let previousProvider = previousAccount.provider
+        let previousEventTask = eventTask
+        resetAccountScopedLoadsAndForumState()
+        let preparationSignpost = AppPerformanceSignposts.signposter.beginInterval(
+            "AccountConnectionPreparation"
+        )
+        var didEndPreparationSignpost = false
+        defer {
+            if !didEndPreparationSignpost {
+                AppPerformanceSignposts.signposter.endInterval(
+                    "AccountConnectionPreparation",
+                    preparationSignpost
+                )
+            }
+        }
+        await AppPerformanceSignposts.measure("PreviousSessionShutdown") {
+            await leaveVoice(account: previousAccount)
+            guard accountSessionGeneration == transitionGeneration else { return }
+            resetAppSounds()
+            await previousProvider.disconnect()
+        }
+        guard accountSessionGeneration == transitionGeneration else { return false }
+        previousEventTask?.cancel()
+        await previousEventTask?.value
+        guard accountSessionGeneration == transitionGeneration else { return false }
+        eventTask = nil
+        await drainAccountChildTasks()
+        guard accountSessionGeneration == transitionGeneration else { return false }
         resetPendingCreatedMessages()
         resetTimelineLiveScrolling()
         clearReactionMutationState()
@@ -41,8 +171,34 @@ extension AppModel {
         if !preservesInteractivePresentation {
             sessionState = .connecting
         }
-        let fingerprint = await UserDefaultsDiscordFingerprintStore.shared.load()
-        provider = authenticatedProviderFactory(handle, fingerprint)
+        let nextDatabase = AppPerformanceSignposts.measureSync("AccountDatabaseOpen") {
+            AccountID(handle.accountID).flatMap {
+                accountDatabaseFactory($0)
+            }
+        }
+        installAccountSession(provider: nextProvider, database: nextDatabase)
+        accountTransitionIsActive = false
+        resetForAccountConnection(handle)
+        resetAccountPresentationState()
+        AppPerformanceSignposts.signposter.endInterval(
+            "AccountConnectionPreparation",
+            preparationSignpost
+        )
+        didEndPreparationSignpost = true
+        await start(
+            publishesSessionState: !preservesInteractivePresentation
+        )
+        guard accountSessionGeneration == transitionGeneration else { return false }
+        isAuthenticated = snapshot != nil
+        sessionState = isAuthenticated ? .workspace : .signedOut
+        if isAuthenticated {
+            await requestNotificationPermissionIfNeeded()
+            guard accountSessionGeneration == transitionGeneration else { return false }
+        }
+        return isAuthenticated
+    }
+
+    func resetForAccountConnection(_ handle: CredentialHandle) {
         resetAcknowledgementWork()
         resetChannelNotificationMutations()
         readState.reset(accountID: handle.accountID)
@@ -52,8 +208,16 @@ extension AppModel {
         componentErrors = [:]
         componentKeyByNonce = [:]
         credentialHandle = handle
+        activeAccountID = handle.accountID
+        didAttemptSessionRestore = true
         commandComposer.configureFrecencyScope(handle.accountID)
-        database = AccountID(handle.accountID).flatMap { try? SakuraCordDatabase(accountID: $0) }
+    }
+
+    func resetAccountPresentationState() {
+        forwardingMessage = nil
+        forwardingErrorMessage = nil
+        isForwardingMessages = false
+        forwardDestinationHistory = []
         snapshot = nil
         serverRailGuildsByID = [:]
         serverRailItems = []
@@ -64,6 +228,13 @@ extension AppModel {
         discordFrequentlyUsedEmojiKeys = []
         discordEmojiUsageScores = [:]
         discordGuildAndChannelUsageScores = [:]
+        discordGuildAndChannelUsage = [:]
+        discordGuildAndChannelUsageOrder = []
+        pendingDiscordFrecencyUses = []
+        appliedDiscordFrecencyDeltasKey = nil
+        lastDiscordFrecencyChannelID = nil
+        lastDiscordFrecencyGuildID = nil
+        didSelectInitialForwardDestination = false
         hasLoadedDiscordEmojiSettings = false
         didAttemptDiscordEmojiSettings = false
         voiceStates = [:]
@@ -77,37 +248,99 @@ extension AppModel {
         hasCompletedInitialThreadLoad = false
         messageCache = [:]
         messageCacheOrder = []
+        messageRowCache = [:]
+        messageRowCacheOrder = []
         hasMoreCache = [:]
+        membersByGuildID = [:]
+        memberListsByGuildID = [:]
+        memberListGroupsByGuildID = [:]
+        memberListViewportRequest = nil
+        lastMemberListVisibleRange = nil
+        guildRolesByGuildID = [:]
+        membersByID = [:]
+        memberListGroups = []
+        guildRoles = []
+        members = []
         dismissAllProfiles(clearsCache: true)
         errorMessage = nil
-        await start(publishesSessionState: !preservesInteractivePresentation)
-        isAuthenticated = snapshot != nil
-        sessionState = isAuthenticated ? .workspace : .signedOut
-        if isAuthenticated {
-            await requestNotificationPermissionIfNeeded()
-        }
-        return isAuthenticated
     }
 
     func logout() async {
-        await leaveVoice()
+        guard await accountTransitionCoordinator.acquireIfAvailable() else { return }
+        accountTransitionIsActive = true
+        invalidateAccountSession()
+        let transitionGeneration = accountSessionGeneration
+        await performLogout(transitionGeneration: transitionGeneration)
+        accountTransitionIsActive = false
+        await accountTransitionCoordinator.release()
+    }
+
+    func logout(accountID: String) async {
+        guard accountID != activeAccountID else {
+            await logout()
+            return
+        }
+        guard await accountTransitionCoordinator.acquireIfAvailable() else { return }
+        accountTransitionIsActive = true
+        do {
+            let handles = try await credentialStore.handles()
+            if let handle = handles.first(where: { $0.accountID == accountID }) {
+                try await removeSavedAccount(handle)
+            } else {
+                savedAccounts.removeAll { $0.accountID == accountID }
+                await savedAccountStore.remove(accountID: accountID)
+                await savedAccountStore.setPreferredAccountID(
+                    activeAccountID ?? savedAccounts.first?.accountID
+                )
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        accountTransitionIsActive = false
+        await accountTransitionCoordinator.release()
+    }
+
+    func performLogout(transitionGeneration: UInt64) async {
+        let previousAccount = accountSession(allowsTransition: true)
+        let previousProvider = previousAccount.provider
+        let previousEventTask = eventTask
+        let previousCredentialHandle = credentialHandle
+        resetAccountScopedLoadsAndForumState()
+        await leaveVoice(account: previousAccount)
+        guard accountSessionGeneration == transitionGeneration else { return }
         resetAppSounds()
-        await provider.disconnect()
-        eventTask?.cancel()
+        await previousProvider.disconnect()
+        guard accountSessionGeneration == transitionGeneration else { return }
+        previousEventTask?.cancel()
+        await previousEventTask?.value
+        guard accountSessionGeneration == transitionGeneration else { return }
+        eventTask = nil
+        await drainAccountChildTasks()
+        guard accountSessionGeneration == transitionGeneration else { return }
         resetPendingCreatedMessages()
         resetTimelineLiveScrolling()
         clearReactionMutationState()
         stopLocalTyping(clearThrottle: true)
         typingState.clearAll()
-        if let credentialHandle {
+        if let previousCredentialHandle {
             do {
-                try await credentialStore.remove(credentialHandle)
+                try await removeSavedAccount(previousCredentialHandle)
+                guard accountSessionGeneration == transitionGeneration else { return }
             } catch {
+                guard accountSessionGeneration == transitionGeneration else { return }
                 errorMessage = error.localizedDescription
-                return
             }
         }
+        installSignedOutAccountState()
+        if launchMode == .offlineTesting {
+            await start()
+            guard accountSessionGeneration == transitionGeneration else { return }
+        }
+    }
+
+    private func installSignedOutAccountState() {
         credentialHandle = nil
+        activeAccountID = nil
         resetAcknowledgementWork()
         resetChannelNotificationMutations()
         readState.reset(accountID: launchMode == .offlineTesting ? "offline" : nil)
@@ -115,15 +348,17 @@ extension AppModel {
         commandComposer.configureFrecencyScope(
             launchMode == .offlineTesting ? "offline" : "signed-out"
         )
-        provider = launchMode == .offlineTesting ? MockChatProvider() : SignedOutChatProvider()
+        let signedOutProvider: any ChatProvider =
+            launchMode == .offlineTesting ? MockChatProvider() : SignedOutChatProvider()
         supportedCapabilities = []
         pendingComponentControls = []
         componentErrors = [:]
         componentKeyByNonce = [:]
-        database =
-            launchMode == .offlineTesting
-                ? try? SakuraCordDatabase(inMemory: true)
-                : try? SakuraCordDatabase(accountID: AccountID(rawValue: 1))
+        let signedOutDatabase = launchMode == .offlineTesting
+            ? try? SakuraCordDatabase(inMemory: true)
+            : nil
+        installAccountSession(provider: signedOutProvider, database: signedOutDatabase)
+        accountTransitionIsActive = false
         snapshot = nil
         serverRailGuildsByID = [:]
         serverRailItems = []
@@ -134,9 +369,16 @@ extension AppModel {
         discordFrequentlyUsedEmojiKeys = []
         discordEmojiUsageScores = [:]
         discordGuildAndChannelUsageScores = [:]
+        discordGuildAndChannelUsage = [:]
+        discordGuildAndChannelUsageOrder = []
+        pendingDiscordFrecencyUses = []
+        appliedDiscordFrecencyDeltasKey = nil
+        lastDiscordFrecencyChannelID = nil
+        lastDiscordFrecencyGuildID = nil
         hasLoadedDiscordEmojiSettings = false
         didAttemptDiscordEmojiSettings = false
         voiceStates = [:]
+        privateCallsByChannel = [:]
         visibleChannels = []
         selectedChannel = nil
         selectedGuildID = nil
@@ -146,46 +388,147 @@ extension AppModel {
         hasCompletedInitialThreadLoad = false
         messageCache = [:]
         messageCacheOrder = []
+        messageRowCache = [:]
+        messageRowCacheOrder = []
         hasMoreCache = [:]
+        membersByGuildID = [:]
+        memberListsByGuildID = [:]
+        memberListGroupsByGuildID = [:]
+        memberListViewportRequest = nil
+        lastMemberListVisibleRange = nil
+        guildRolesByGuildID = [:]
+        membersByID = [:]
+        memberListGroups = []
+        guildRoles = []
         members = []
         dismissAllProfiles(clearsCache: true)
         connectionState = .disconnected
         isAuthenticated = false
         didAttemptSessionRestore = true
         sessionState = launchMode == .offlineTesting ? .connecting : .signedOut
-        if launchMode == .offlineTesting {
-            await start()
-        }
+    }
+
+    private func removeSavedAccount(_ handle: CredentialHandle) async throws {
+        try await credentialStore.remove(handle)
+        await savedAccountStore.remove(accountID: handle.accountID)
+        savedAccounts.removeAll { $0.accountID == handle.accountID }
+        await savedAccountStore.setPreferredAccountID(
+            savedAccounts.first?.accountID
+        )
     }
 
     func start(publishesSessionState: Bool = true) async {
+        let session = accountSession()
+        let startSignpost = AppPerformanceSignposts.signposter.beginInterval("SessionStart")
+        defer {
+            AppPerformanceSignposts.signposter.endInterval("SessionStart", startSignpost)
+        }
         guard snapshot == nil else { return }
         guard await prepareSessionStart() else { return }
+        guard isCurrentAccountSession(session) else { return }
         if publishesSessionState {
             sessionState = .connecting
         }
-        await refreshSupportedCapabilities()
-        let stream = await provider.eventStream()
+        await refreshSupportedCapabilities(for: session)
+        guard isCurrentAccountSession(session) else { return }
+        let stream = await session.provider.eventStream()
+        guard isCurrentAccountSession(session) else { return }
+        installEventTask(stream, account: session)
+        isLoading = true
+        defer {
+            if isCurrentAccountSession(session) {
+                isLoading = false
+            }
+        }
+        do {
+            let value = try await AppPerformanceSignposts.measure("ProviderBootstrap") {
+                try await session.provider.bootstrap()
+            }
+            guard isCurrentAccountSession(session) else { return }
+            await applyLiveBootstrap(
+                value,
+                publishesSessionState: publishesSessionState,
+                account: session
+            )
+            guard isCurrentAccountSession(session) else { return }
+        } catch {
+            await failAuthenticatedSessionStart(error, account: session)
+        }
+    }
+
+    func failAuthenticatedSessionStart(
+        _ error: any Error,
+        account session: AppModelAccountSession
+    ) async {
+        guard isCurrentAccountSession(session) else { return }
+        guard launchMode == .normal else {
+            handleSessionStartFailure(error, account: session)
+            return
+        }
+
+        await session.provider.disconnect()
+        eventTask?.cancel()
+        await eventTask?.value
+        guard isCurrentAccountSession(session) else { return }
+        eventTask = nil
+        await drainAccountChildTasks()
+        guard isCurrentAccountSession(session) else { return }
+
+        installAccountSession(provider: SignedOutChatProvider(), database: nil)
+        credentialHandle = nil
+        activeAccountID = nil
+        supportedCapabilities = []
+        connectionState = .disconnected
+        readState.reset(accountID: nil)
+        commandComposer.configureFrecencyScope("signed-out")
+        resetAccountPresentationState()
+        isLoading = false
+        handleSessionStartFailure(error, account: accountSession())
+    }
+
+    func installEventTask(
+        _ stream: AsyncStream<ClientEvent>,
+        account: AppModelAccountSession
+    ) {
         eventTask = Task { [weak self] in
             for await event in stream {
-                guard !Task.isCancelled else { break }
-                await self?.consume(event)
+                guard let self,
+                      !Task.isCancelled,
+                      self.isCurrentAccountSession(account)
+                else { break }
+                await self.consume(event)
             }
         }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let value = try await provider.bootstrap()
-            await applyBootstrap(value, publishesSessionState: publishesSessionState)
-        } catch {
-            errorMessage = error.localizedDescription
-            if launchMode == .normal {
-                isAuthenticated = false
-                if publishesSessionState {
-                    sessionState = .signedOut
-                }
-            }
+    }
+
+    func applyLiveBootstrap(
+        _ value: BootstrapSnapshot,
+        publishesSessionState: Bool,
+        account: AppModelAccountSession
+    ) async {
+        guard isCurrentAccountSession(account) else { return }
+        await AppPerformanceSignposts.measure("BootstrapApplication") {
+            await applyBootstrap(
+                value,
+                publishesSessionState: publishesSessionState,
+                account: account
+            )
         }
+    }
+
+    func handleSessionStartFailure(
+        _ error: any Error,
+        account: AppModelAccountSession
+    ) {
+        guard isCurrentAccountSession(account) else { return }
+        errorMessage = error.localizedDescription
+        guard launchMode == .normal else { return }
+        // No workspace is published until bootstrap succeeds. A failed
+        // bootstrap must return to sign-in without exposing partial state.
+        snapshot = nil
+        isAuthenticated = false
+        activeAccountID = nil
+        sessionState = .signedOut
     }
 
     func prepareSessionStart() async -> Bool {
@@ -204,9 +547,35 @@ extension AppModel {
         }
         if launchMode == .normal, !didAttemptSessionRestore {
             didAttemptSessionRestore = true
-            if restoresStoredSession,
-               let handles = try? await credentialStore.handles(),
-               let handle = handles.first
+            let handles: [CredentialHandle]? = if restoresStoredSession {
+                try? await AppPerformanceSignposts.measure(
+                    "CredentialRestore"
+                ) {
+                    try await credentialStore.handles()
+                }
+            } else {
+                nil
+            }
+            if let handles {
+                savedAccounts = await savedAccountStore.accounts(
+                    matching: handles
+                )
+            }
+            let preferredPerformanceAccountID =
+                runsChatPerformanceBenchmark
+                    ? ProcessInfo.processInfo.environment[
+                        "SAKURACORD_PERFORMANCE_ACCOUNT_ID"
+                    ]
+                    : nil
+            let preferredStoredAccountID = await savedAccountStore
+                .preferredAccountID()
+            if let handles,
+               let handle = RestoredCredentialSelectionPolicy.handle(
+                   from: handles,
+                   preferredAccountID:
+                       preferredPerformanceAccountID
+                       ?? preferredStoredAccountID
+               )
             {
                 _ = await connectAuthenticatedAccount(handle)
                 return false
@@ -222,9 +591,24 @@ extension AppModel {
 
     func applyBootstrap(
         _ value: BootstrapSnapshot,
-        publishesSessionState: Bool
+        publishesSessionState: Bool,
+        account: AppModelAccountSession? = nil
     ) async {
+        if let account, !isCurrentAccountSession(account) { return }
         snapshot = value
+        configureForwardDestinationHistoryScope(
+            credentialHandle?.accountID
+                ?? (launchMode == .offlineTesting ? "offline" : "signed-out")
+        )
+        if let handle = credentialHandle,
+           handle.accountID == value.currentUser.id.description
+        {
+            let account = SavedAccount(user: value.currentUser)
+            await savedAccountStore.record(account)
+            savedAccounts.removeAll { $0.accountID == account.accountID }
+            savedAccounts.insert(account, at: 0)
+            activeAccountID = account.accountID
+        }
         reconcilePrivateCallSounds()
         readState.configure(
             accountID: credentialHandle?.accountID ?? (launchMode == .offlineTesting ? "offline" : nil),
@@ -241,17 +625,31 @@ extension AppModel {
         logBootstrapUnreadState(value)
         applyBootstrapCurrentUserRoles(value)
         updateServerRail(from: value)
-        refreshUnreadPresentation()
+        refreshUnreadPresentation(appliesAccessImmediately: true)
         if credentialHandle != nil {
             isAuthenticated = true
         }
         members = value.members
-        currentStatus = await provider.currentStatus()
-        await activateGuild(value.guilds.first?.id)
-        await channelLoadTask?.value
+        let status = await (account?.provider ?? provider).currentStatus()
+        if let account, !isCurrentAccountSession(account) { return }
+        currentStatus = status
+        let retainedChannel = selectedChannelID.flatMap { selectedChannelID in
+            value.channels.first { $0.id == selectedChannelID }
+        }
+        await activateGuild(
+            retainedChannel?.guildID ?? value.guilds.first?.id,
+            account: account
+        )
+        if let account, !isCurrentAccountSession(account) { return }
+        if let retainedChannel,
+           selectedChannelID != retainedChannel.id
+        {
+            selectedChannelID = retainedChannel.id
+        }
         if publishesSessionState {
             sessionState = .workspace
         }
+        await channelLoadTask?.value
     }
 
     func logBootstrapUnreadState(_ value: BootstrapSnapshot) {
@@ -295,18 +693,25 @@ extension AppModel {
         readState.updateCurrentUserRoles(roleIDs, guildID: firstGuildID)
     }
 
-    func refreshSupportedCapabilities() async {
+    func refreshSupportedCapabilities(
+        for session: AppModelAccountSession
+    ) async {
         var values: Set<ChatCapability> = []
-        for capability in ChatCapability.allCases where await provider.supports(capability) {
-            values.insert(capability)
+        for capability in ChatCapability.allCases {
+            let supported = await session.provider.supports(capability)
+            guard isCurrentAccountSession(session) else { return }
+            if supported {
+                values.insert(capability)
+            }
         }
         supportedCapabilities = values
     }
 
     func selectGuild(_ guildID: GuildID?) {
         guildActivationTask?.cancel()
-        guildActivationTask = Task { [weak self] in
-            await self?.activateGuild(guildID)
+        let account = accountSession()
+        guildActivationTask = startAccountChildTask(account: account) { model, account in
+            await model.activateGuild(guildID, account: account)
         }
     }
 
@@ -347,6 +752,79 @@ extension AppModel {
         )
     }
 
+    func updateMemberListViewport(_ visibleRange: ClosedRange<Int>) {
+        guard let guildID = selectedGuildID,
+              let channelID = selectedChannelID
+        else { return }
+        lastMemberListVisibleRange = visibleRange
+        let session = accountSession()
+        let request = MemberListViewportRequest(
+            guildID: guildID,
+            channelID: channelID,
+            visibleRange: visibleRange
+        )
+        memberListViewportRequest = request
+        submitMemberListViewport(request, account: session)
+    }
+
+    func submitMemberListViewport(
+        _ request: MemberListViewportRequest,
+        account session: AppModelAccountSession
+    ) {
+        Task { [weak self] in
+            guard let self,
+                  isCurrentAccountSession(session),
+                  memberListViewportRequest == request,
+                  selectedGuildID == request.guildID,
+                  selectedChannelID == request.channelID
+            else { return }
+            do {
+                try await session.provider.updateMemberListViewport(
+                    in: request.guildID,
+                    channelID: request.channelID,
+                    visibleRange: request.visibleRange
+                )
+            } catch {
+                guard isCurrentAccountSession(session) else { return }
+                AppModel.memberListLogger.debug(
+                    "Member-list viewport subscription failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    func replayMemberListViewportIfNeeded(
+        for guildID: GuildID,
+        account session: AppModelAccountSession
+    ) async {
+        guard let channelID = selectedChannelID,
+              isCurrentAccountSession(session)
+        else { return }
+        // An empty cold member list has no native row from which the canvas can
+        // derive a viewport. Seed the first Gateway block after members(in:)
+        // arms the subscription; subsequent reports replace this with the real
+        // visible range.
+        let visibleRange = lastMemberListVisibleRange ?? 0 ... 0
+        let request = MemberListViewportRequest(
+            guildID: guildID,
+            channelID: channelID,
+            visibleRange: visibleRange
+        )
+        memberListViewportRequest = request
+        do {
+            try await session.provider.updateMemberListViewport(
+                in: request.guildID,
+                channelID: request.channelID,
+                visibleRange: request.visibleRange
+            )
+        } catch {
+            guard isCurrentAccountSession(session) else { return }
+            AppModel.memberListLogger.debug(
+                "Member-list viewport replay failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
     func mergedMemberStore(with updates: [Member]) -> [UserID: Member] {
         guard let guildID = selectedGuildID else {
             return Dictionary(
@@ -367,10 +845,14 @@ extension AppModel {
         // state, so retain the last Gateway/REST catalog like Paicord's
         // per-guild role store instead of blanking every message author.
         guard !roles.isEmpty else { return }
+        guard guildRolesByGuildID[guildID] != roles else { return }
         guildRolesByGuildID[guildID] = roles
-        if selectedGuildID == guildID {
-            guildRoles = roles
-        }
+        guard selectedGuildID == guildID else { return }
+        guildRoles = roles
+        refreshUnreadPresentation(
+            appliesAccessImmediately: true,
+            accessAffectedGuildIDs: [guildID]
+        )
     }
 
     var directMessageInspectorSections: [MemberSection] {
@@ -396,13 +878,15 @@ extension AppModel {
             return
         }
         guildActivationTask?.cancel()
-        guildActivationTask = Task { [weak self] in
-            guard let self else { return }
-            if selectedGuildID != channel.guildID {
-                await activateGuild(channel.guildID)
+        let account = accountSession()
+        guildActivationTask = startAccountChildTask(account: account) { model, account in
+            if model.selectedGuildID != channel.guildID {
+                await model.activateGuild(channel.guildID, account: account)
             }
-            guard !Task.isCancelled else { return }
-            selectedChannelID = channel.id
+            guard !Task.isCancelled,
+                  model.isCurrentAccountSession(account)
+            else { return }
+            model.selectedChannelID = channel.id
         }
     }
 
@@ -415,15 +899,16 @@ extension AppModel {
         }
 
         guildActivationTask?.cancel()
-        guildActivationTask = Task { [weak self] in
+        let session = accountSession()
+        guildActivationTask = startAccountChildTask(account: session) { [weak self] _, session in
             guard let self else { return }
             let knownPost =
                 forumCataloguePosts.first(where: { $0.id == channelID })
                     ?? forumPosts.first(where: { $0.id == channelID })
             if selectedGuildID != guildID {
-                await activateGuild(guildID)
+                await activateGuild(guildID, account: session)
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isCurrentAccountSession(session) else { return }
             if let channel =
                 snapshot?.channels.first(where: { $0.id == channelID })
                     ?? visibleChannels.first(where: { $0.id == channelID })
@@ -437,21 +922,23 @@ extension AppModel {
                 post = if let knownPost {
                     knownPost
                 } else {
-                    try await provider.forumPost(threadID: channelID)
+                    try await session.provider.forumPost(threadID: channelID)
                 }
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 errorMessage = error.localizedDescription
                 return
             }
 
             let targetGuildID = post.thread.guildID ?? guildID
             if selectedGuildID != targetGuildID {
-                await activateGuild(targetGuildID)
+                await activateGuild(targetGuildID, account: session)
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isCurrentAccountSession(session) else { return }
             guard let parentID = post.thread.parentID,
                   let parent =
                   snapshot?.channels.first(where: { $0.id == parentID })
@@ -464,7 +951,10 @@ extension AppModel {
                 selectedChannelID = parent.id
             }
             await channelLoadTask?.value
-            guard !Task.isCancelled, selectedChannelID == parent.id else { return }
+            guard !Task.isCancelled,
+                  isCurrentAccountSession(session),
+                  selectedChannelID == parent.id
+            else { return }
             if parent.kind == .forum {
                 mergeForumCatalogue([post])
                 applyForumPresentation()
@@ -475,12 +965,13 @@ extension AppModel {
 
     func navigate(to guildID: GuildID?, channelID: ChannelID, messageID: MessageID) {
         guildActivationTask?.cancel()
-        guildActivationTask = Task { [weak self] in
+        let session = accountSession()
+        guildActivationTask = startAccountChildTask(account: session) { [weak self] _, session in
             guard let self else { return }
             if selectedGuildID != guildID {
-                await activateGuild(guildID)
+                await activateGuild(guildID, account: session)
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isCurrentAccountSession(session) else { return }
             guard
                 let channel = snapshot?.channels.first(where: { $0.id == channelID })
                 ?? visibleChannels.first(where: { $0.id == channelID })
@@ -492,7 +983,10 @@ extension AppModel {
                 selectedChannelID = channel.id
             }
             await channelLoadTask?.value
-            guard !Task.isCancelled, selectedChannelID == channel.id else { return }
+            guard !Task.isCancelled,
+                  isCurrentAccountSession(session),
+                  selectedChannelID == channel.id
+            else { return }
 
             if !messages.contains(where: { $0.id == messageID }) {
                 do {
@@ -500,26 +994,33 @@ extension AppModel {
                         messageID.rawValue == UInt64.max
                             ? nil
                             : MessageID(rawValue: messageID.rawValue + 1)
-                    let page = try await provider.messages(
+                    let page = try await session.provider.messages(
                         in: channel.id,
                         before: beforeID,
                         limit: 50
                     )
-                    guard !Task.isCancelled, selectedChannelID == channel.id else { return }
+                    guard !Task.isCancelled,
+                          isCurrentAccountSession(session),
+                          selectedChannelID == channel.id
+                    else { return }
                     replaceSelectedMessages(
                         with: Self.merging(current: messages, fresh: page.messages)
                     )
-                    try await database?.save(messages: page.messages)
                 } catch is CancellationError {
                     return
                 } catch {
-                    guard selectedChannelID == channel.id else { return }
+                    guard isCurrentAccountSession(session),
+                          selectedChannelID == channel.id
+                    else { return }
                     errorMessage = error.localizedDescription
                     return
                 }
             }
 
-            guard messages.contains(where: { $0.id == messageID }) else {
+            guard isCurrentAccountSession(session),
+                  messages.contains(where: { $0.id == messageID })
+            else {
+                guard isCurrentAccountSession(session) else { return }
                 errorMessage = "That message could not be found in the linked channel."
                 return
             }
@@ -558,13 +1059,26 @@ extension AppModel {
         conversationNewestRequest = nil
     }
 
-    func activateGuild(_ guildID: GuildID?) async {
+    func activateGuild(
+        _ guildID: GuildID?,
+        account: AppModelAccountSession? = nil
+    ) async {
+        let session = account ?? accountSession()
+        guard !Task.isCancelled,
+              isCurrentAccountSession(session)
+        else { return }
+        let activationSignpost = AppPerformanceSignposts.signposter.beginInterval(
+            "GuildActivation"
+        )
+        defer {
+            AppPerformanceSignposts.signposter.endInterval(
+                "GuildActivation",
+                activationSignpost
+            )
+        }
         dismissAllProfiles()
         selectedGuildID = guildID
-        memberListGroups = []
-        guildRoles = guildID.flatMap { guildRolesByGuildID[$0] } ?? []
-        membersByID = guildID.flatMap { membersByGuildID[$0] } ?? [:]
-        members = []
+        restoreMemberPresentation(for: guildID)
         mentionAutocompleteMembers = []
         var channels =
             snapshot?.channels.filter { channel in
@@ -573,28 +1087,76 @@ extension AppModel {
         visibleChannels = channels
         if channels.isEmpty {
             do {
-                channels = try await provider.channels(in: guildID)
+                channels = try await session.provider.channels(in: guildID)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      selectedGuildID == guildID
+                else { return }
                 if var value = snapshot {
                     value.channels.removeAll { $0.guildID == guildID }
                     value.channels.append(contentsOf: channels)
                     snapshot = value
                 }
             } catch {
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session)
+                else { return }
                 errorMessage = error.localizedDescription
             }
         }
-        guard !Task.isCancelled, selectedGuildID == guildID else { return }
+        guard !Task.isCancelled,
+              isCurrentAccountSession(session),
+              selectedGuildID == guildID
+        else { return }
         visibleChannels = channels
+        if let guildID {
+            refreshUnreadPresentation(
+                appliesAccessImmediately: true,
+                accessAffectedGuildIDs: [guildID]
+            )
+        }
         if launchMode == .offlineTesting, let guildID {
             await loadEmojis(for: guildID)
+            guard isCurrentAccountSession(session) else { return }
         }
         if !visibleChannels.contains(where: { $0.id == selectedChannelID }) {
             let selectableChannels = visibleChannels.filter {
                 conversationAccess(for: $0) != .hidden
             }
-            selectedChannelID = Self.preferredInitialChannelID(in: selectableChannels)
+            let preferredChannelID = Self.preferredInitialChannelID(in: selectableChannels)
+            pendingAutomaticChannelAccessID = preferredChannelID.flatMap { id in
+                selectableChannels.first(where: { $0.id == id }).flatMap { channel in
+                    conversationAccess(for: channel) == .checking ? id : nil
+                }
+            }
+            selectedChannelID = preferredChannelID
         }
         beginMemberLoad(for: guildID)
+    }
+
+    func restoreMemberPresentation(for guildID: GuildID?) {
+        let restoredGroups = guildID.flatMap { memberListGroupsByGuildID[$0] } ?? []
+        let restoredRoles = guildID.flatMap { guildRolesByGuildID[$0] } ?? []
+        let restoredMembersByID = guildID.flatMap { membersByGuildID[$0] } ?? [:]
+        let restoredMembers = guildID.flatMap { memberListsByGuildID[$0] } ?? []
+        let presentationChanged =
+            memberListGroups != restoredGroups
+            || guildRoles != restoredRoles
+            || members != restoredMembers
+
+        defersMemberPresentationRebuild = true
+        memberListGroups = restoredGroups
+        guildRoles = restoredRoles
+        membersByID = restoredMembersByID
+        members = restoredMembers
+        defersMemberPresentationRebuild = false
+
+        guard presentationChanged else { return }
+        rebuildMemberSections()
+        AppPerformanceSignposts.signposter.emitEvent(
+            "TimelineInvalidationGuildPresentationRestore"
+        )
+        invalidateTimelinePresentation()
     }
 
     nonisolated static func preferredInitialChannelID(in channels: [Channel]) -> ChannelID? {
@@ -606,20 +1168,24 @@ extension AppModel {
                 false
             }
         }
-        return textChannels.first(where: { $0.name == "general" })?.id
-            ?? textChannels.first?.id
-            ?? channels.first(where: { $0.name == "general" })?.id
-            ?? channels.first?.id
+        return textChannels.first?.id ?? channels.first?.id
     }
 
     func loadEmojis(for guildID: GuildID) async {
         guard emojisByGuild[guildID] == nil, !loadingEmojiGuildIDs.contains(guildID) else { return }
+        let session = accountSession()
         loadingEmojiGuildIDs.insert(guildID)
-        defer { loadingEmojiGuildIDs.remove(guildID) }
+        defer {
+            if isCurrentAccountSession(session) {
+                loadingEmojiGuildIDs.remove(guildID)
+            }
+        }
         do {
-            let emojis = try await provider.emojis(in: guildID)
+            let emojis = try await session.provider.emojis(in: guildID)
+            guard isCurrentAccountSession(session) else { return }
             applyEmojis(emojis, to: guildID)
         } catch {
+            guard isCurrentAccountSession(session) else { return }
             emojiLoadErrorsByGuild[guildID] = error.localizedDescription
         }
     }
@@ -667,13 +1233,25 @@ extension AppModel {
 
     func loadDiscordEmojiSettings() async {
         guard !didAttemptDiscordEmojiSettings else { return }
+        let session = accountSession()
         didAttemptDiscordEmojiSettings = true
-        guard let settings = try? await provider.emojiUserSettings() else { return }
-        discordFavoriteEmojiKeys = settings.favoriteKeys
-        discordFrequentlyUsedEmojiKeys = settings.frequentlyUsedKeys
-        discordEmojiUsageScores = settings.usageScores
-        discordGuildAndChannelUsageScores = settings.guildAndChannelUsageScores
+        let settings = try? await session.provider.emojiUserSettings()
+        guard isCurrentAccountSession(session) else { return }
+        if let settings {
+            discordFavoriteEmojiKeys = settings.favoriteKeys
+            discordFrequentlyUsedEmojiKeys = settings.frequentlyUsedKeys
+            discordEmojiUsageScores = settings.usageScores
+            discordGuildAndChannelUsageScores = settings.guildAndChannelUsageScores
+            discordGuildAndChannelUsage = settings.guildAndChannelUsage
+            discordGuildAndChannelUsageOrder = settings.guildAndChannelUsageOrder
+        }
+        // Destination discovery is local once bootstrap state is available.
+        // A failed or timed-out settings enrichment must not leave Forward on
+        // an infinite loading state; persisted local deltas still provide the
+        // best available frecency signal until the next authenticated session.
         hasLoadedDiscordEmojiSettings = true
+        applyPersistedDiscordFrecencyUsageDeltas()
+        forwardSearchSourceRevision &+= 1
     }
 
     func recordEmojiUse(_ key: String) {
@@ -703,13 +1281,138 @@ extension AppModel {
         )
     }
 
+    /// Invalidates asynchronous work and presentation state owned by the
+    /// current account. IDs are not sufficient guards here because Discord
+    /// guild, channel, and thread IDs remain identical when the same account
+    /// reconnects through a replacement provider.
+    func resetAccountScopedLoadsAndForumState() {
+        cancelAccountChildTasks()
+        clientAppStateUpdateTask?.cancel()
+        clientAppStateUpdateTask = nil
+        channelLoadTask?.cancel()
+        channelLoadTask = nil
+        channelLoadGeneration &+= 1
+        threadLoadTask?.cancel()
+        threadLoadTask = nil
+        replyingTo = nil
+        threadReplyingTo = nil
+        conversationRefreshJournals.removeAll(keepingCapacity: false)
+        memberLoadTask?.cancel()
+        memberLoadTask = nil
+        memberLoadGeneration &+= 1
+        guildActivationTask?.cancel()
+        guildActivationTask = nil
+        gifSearchTask?.cancel()
+        gifSearchTask = nil
+        gifPickerLoadTask?.cancel()
+        gifPickerLoadTask = nil
+        gifPickerLoadGeneration &+= 1
+        gifResults = []
+        gifCategories = []
+        gifTrendingPreviewURL = nil
+        favoriteGIFs = []
+        isLoadingGIFs = false
+        isLoadingGIFPicker = false
+        gifFavoriteMutationURL = nil
+        gifErrorMessage = nil
+        externalAttachmentUploadGeneration &+= 1
+        externalAttachmentUploadTask?.cancel()
+        externalAttachmentUploadTask = nil
+        externalAttachmentUploadPresentation = nil
+        releaseAllOwnedPromisedFiles()
+        channelComposerAttachments = []
+        threadComposerAttachments = []
+        oversizedAttachmentPrompt = nil
+        queuedOversizedAttachmentPrompts.removeAll()
+        commandLoadTask?.cancel()
+        commandLoadTask = nil
+        commandAutocompleteTask?.cancel()
+        commandAutocompleteTask = nil
+        commandMemberSearchTask?.cancel()
+        commandMemberSearchTask = nil
+        commandMemberSearchQuery = nil
+        commandMemberSearchCache = [:]
+        commandMemberResults = []
+        mentionMemberSearchTask?.cancel()
+        mentionMemberSearchTask = nil
+        mentionMemberSearchQuery = nil
+        mentionMemberSearchCache = [:]
+        mentionMemberResults = []
+        mentionAutocompleteMembers = []
+        knownMentionMembers = [:]
+        roleMemberTask?.cancel()
+        roleMemberTask = nil
+        roleMemberResult = nil
+        roleMemberErrorMessage = nil
+        isLoadingRoleMembers = false
+        commandExecutionTask?.cancel()
+        commandExecutionTask = nil
+        inspectorProfileTask?.cancel()
+        inspectorProfileTask = nil
+        contextualProfileTask?.cancel()
+        contextualProfileTask = nil
+        for task in stickerLoadTasks.values {
+            task.cancel()
+        }
+        stickerLoadTasks = [:]
+        stickerLoadGeneration &+= 1
+        stickersByGuild = [:]
+        loadingReactionReactors = []
+        failedReactionReactorLoads = [:]
+        resetForumLoadAndPresentationState()
+    }
+
+    func resetForumLoadAndPresentationState() {
+        forumLoadTask?.cancel()
+        forumLoadTask = nil
+        forumLoadGeneration &+= 1
+        forumCreateGeneration &+= 1
+        forumNextOffset = nil
+        forumPosts = []
+        forumCataloguePosts = []
+        forumCatalogueIndexByID = [:]
+        forumRecentPostCount = 0
+        isLoadingForumPosts = false
+        isSearchingForumPosts = false
+        hasLoadedForumPosts = false
+        isLoadingMoreForumPosts = false
+        hasMoreForumPosts = false
+        forumPostError = nil
+        forumActionError = nil
+        forumPaginationError = nil
+        forumCreateProgress = nil
+        forumSearchText = ""
+        forumSelectedTagIDs = []
+        forumSortOrder = .latestActivity
+        forumLayout = .list
+        forumTagMatch = .matchSome
+    }
+
     func beginMemberLoad(for guildID: GuildID?) {
         memberLoadTask?.cancel()
+        memberLoadGeneration &+= 1
+        let requestGeneration = memberLoadGeneration
+        let session = accountSession()
+        let requestProvider = session.provider
         memberLoadTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
+            defer {
+                if isCurrentAccountSession(session),
+                   memberLoadGeneration == requestGeneration
+                {
+                    memberLoadTask = nil
+                }
+            }
             do {
-                let value = try await provider.members(in: guildID)
-                guard !Task.isCancelled, selectedGuildID == guildID else { return }
+                let value = try await requestProvider.members(in: guildID)
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      memberLoadGeneration == requestGeneration,
+                      selectedGuildID == guildID
+                else { return }
+                if let guildID {
+                    memberListsByGuildID[guildID] = value
+                }
                 members = value
                 // Keep the pre-subscription GuildMemberStore snapshot for
                 // composer search. Full member-list subscriptions feed the
@@ -717,14 +1420,29 @@ extension AppModel {
                 // as autocomplete's candidate store.
                 mentionAutocompleteMembers = value
                 if let guildID {
-                    if let roles = try? await provider.roles(in: guildID) {
+                    await replayMemberListViewportIfNeeded(
+                        for: guildID,
+                        account: session
+                    )
+                }
+                if let guildID {
+                    if let roles = try? await requestProvider.roles(in: guildID),
+                       !Task.isCancelled,
+                       isCurrentAccountSession(session),
+                       memberLoadGeneration == requestGeneration,
+                       selectedGuildID == guildID
+                    {
                         applyGuildRoles(roles, to: guildID)
                     }
                 } else {
                     guildRoles = []
                 }
             } catch {
-                guard !Task.isCancelled, selectedGuildID == guildID else { return }
+                guard !Task.isCancelled,
+                      isCurrentAccountSession(session),
+                      memberLoadGeneration == requestGeneration,
+                      selectedGuildID == guildID
+                else { return }
                 members =
                     snapshot.map {
                         [Member(user: $0.currentUser, roleName: "You", status: currentStatus)]
@@ -739,32 +1457,18 @@ extension AppModel {
 
     func beginForumLoad() {
         channelLoadTask?.cancel()
-        forumLoadTask?.cancel()
+        resetForumLoadAndPresentationState()
         replaceSelectedMessages(with: [])
         draft = ""
         messageLoadError = nil
         isLoadingMessages = false
-        forumPosts = []
-        forumCataloguePosts = []
-        forumCatalogueIndexByID = [:]
-        forumRecentPostCount = 0
-        forumNextOffset = nil
-        forumPostError = nil
-        forumActionError = nil
-        forumPaginationError = nil
-        isLoadingForumPosts = false
-        isSearchingForumPosts = false
-        isLoadingMoreForumPosts = false
-        hasLoadedForumPosts = false
-        hasMoreForumPosts = false
-        forumSearchText = ""
-        forumSelectedTagIDs = []
         if let channel = selectedChannel {
             forumSortOrder = channel.defaultSortOrder ?? .latestActivity
             forumLayout =
                 channel.defaultForumLayout == .defaultLayout ? .list : channel.defaultForumLayout
             forumTagMatch = channel.defaultTagMatch
         }
+        guard selectedConversationAccess.isReadable else { return }
         forumLoadTask = Task { [weak self] in
             await self?.loadForumPosts(reset: true)
         }
@@ -826,7 +1530,12 @@ extension AppModel {
     }
 
     func loadForumPosts(reset: Bool) async {
-        guard let channelID = selectedChannelID, selectedChannel?.kind == .forum else { return }
+        guard !Task.isCancelled,
+              let channelID = selectedChannelID,
+              selectedChannel?.kind == .forum,
+              selectedConversationAccess.isReadable
+        else { return }
+        let session = accountSession()
         let loadSignpost = Self.forumPerformanceSignposter.beginInterval("ForumPostsLoad")
         defer {
             Self.forumPerformanceSignposter.endInterval("ForumPostsLoad", loadSignpost)
@@ -857,7 +1566,10 @@ extension AppModel {
                 : nil
         defer {
             loadingIndicatorTask?.cancel()
-            if selectedChannelID == channelID, forumLoadGeneration == requestGeneration {
+            if isCurrentAccountSession(session),
+               selectedChannelID == channelID,
+               forumLoadGeneration == requestGeneration
+            {
                 isLoadingForumPosts = false
                 isLoadingMoreForumPosts = false
                 if isSearch { isSearchingForumPosts = false }
@@ -869,17 +1581,23 @@ extension AppModel {
                 : .active
         do {
             let page = try await requestForumPosts(
+                provider: session.provider,
                 channelID: channelID,
                 scope: scope,
                 reset: reset
             )
-            guard !Task.isCancelled, selectedChannelID == channelID,
+            guard !Task.isCancelled,
+                  isCurrentAccountSession(session),
+                  selectedChannelID == channelID,
                   forumLoadGeneration == requestGeneration
             else { return }
             applyForumPage(page, isSearch: isSearch, reset: reset, channelID: channelID)
         } catch {
             guard !Self.isForumLoadCancellation(error) else { return }
-            guard selectedChannelID == channelID, forumLoadGeneration == requestGeneration else {
+            guard isCurrentAccountSession(session),
+                  selectedChannelID == channelID,
+                  forumLoadGeneration == requestGeneration
+            else {
                 return
             }
             applyForumLoadError(error, isSearch: isSearch, reset: reset)
@@ -887,6 +1605,7 @@ extension AppModel {
     }
 
     func requestForumPosts(
+        provider: any ChatProvider,
         channelID: ChannelID,
         scope: ForumPostScope,
         reset: Bool
@@ -1092,6 +1811,7 @@ extension AppModel {
         forumActionError = nil
         forumCreateGeneration &+= 1
         let generation = forumCreateGeneration
+        let session = accountSession()
         defer {
             if forumCreateGeneration == generation {
                 forumCreateProgress = nil
@@ -1099,17 +1819,22 @@ extension AppModel {
             }
         }
         do {
-            let post = try await provider.createForumPost(draft) { [weak self] progress in
+            let post = try await session.provider.createForumPost(draft) { [weak self] progress in
                 Task { @MainActor in
-                    guard let self, self.forumCreateGeneration == generation else { return }
+                    guard let self,
+                          self.isCurrentAccountSession(session),
+                          self.forumCreateGeneration == generation
+                    else { return }
                     self.forumCreateProgress = progress
                 }
             }
+            guard isCurrentAccountSession(session) else { return false }
             mergeForumCatalogue([post])
             applyForumPresentation()
             open(post)
             return true
         } catch {
+            guard isCurrentAccountSession(session) else { return false }
             if Self.isForumLoadCancellation(error) {
                 return false
             }
@@ -1121,38 +1846,7 @@ extension AppModel {
     func updateForumPost(_ post: ForumPost, mutation: ForumPostMutation) async {
         switch mutation {
         case .tags(let tagIDs):
-            guard canEditForumPostTags(post) else {
-                forumActionError = "You do not have permission to edit this post’s tags."
-                return
-            }
-            let uniqueTagIDs = Set(tagIDs)
-            guard uniqueTagIDs.count <= 5,
-                  let channel = selectedChannel,
-                  channel.id == post.thread.parentID
-            else {
-                forumActionError = "The selected tags are invalid for this forum."
-                return
-            }
-            let availableTagsByID = Dictionary(
-                uniqueKeysWithValues: channel.availableTags.map { ($0.id, $0) }
-            )
-            guard uniqueTagIDs.allSatisfy({ availableTagsByID[$0] != nil }) else {
-                forumActionError = "One or more selected tags are no longer available."
-                return
-            }
-            guard !channel.requiresForumTag || !uniqueTagIDs.isEmpty else {
-                forumActionError = "This forum requires every post to have at least one tag."
-                return
-            }
-            if !canManageForumPosts {
-                let changedTagIDs = uniqueTagIDs.symmetricDifference(post.thread.appliedTagIDs)
-                guard changedTagIDs.allSatisfy({
-                    availableTagsByID[$0]?.isModerated == false
-                }) else {
-                    forumActionError = "Only moderators can change moderated tags."
-                    return
-                }
-            }
+            guard validateForumTagMutation(tagIDs, for: post) else { return }
         case .archived:
             guard canArchiveForumPost(post) else {
                 forumActionError = "You do not have permission to close or reopen this post."
@@ -1166,14 +1860,59 @@ extension AppModel {
         }
 
         forumActionError = nil
+        let session = accountSession()
         do {
-            let updated = try await provider.updateForumPost(post, mutation: mutation)
+            let updated = try await session.provider.updateForumPost(
+                post,
+                mutation: mutation
+            )
+            guard isCurrentAccountSession(session) else { return }
             mergeForumCatalogue([updated])
             applyForumPresentation()
             if openThread?.id == updated.id { openThread = updated.thread }
         } catch {
+            guard isCurrentAccountSession(session) else { return }
             forumActionError = error.localizedDescription
         }
+    }
+
+    func validateForumTagMutation(
+        _ tagIDs: [ForumTagID],
+        for post: ForumPost
+    ) -> Bool {
+        guard canEditForumPostTags(post) else {
+            forumActionError = "You do not have permission to edit this post’s tags."
+            return false
+        }
+        let uniqueTagIDs = Set(tagIDs)
+        guard uniqueTagIDs.count <= 5,
+              let channel = selectedChannel,
+              channel.id == post.thread.parentID
+        else {
+            forumActionError = "The selected tags are invalid for this forum."
+            return false
+        }
+        let availableTagsByID = Dictionary(
+            uniqueKeysWithValues: channel.availableTags.map { ($0.id, $0) }
+        )
+        guard uniqueTagIDs.allSatisfy({ availableTagsByID[$0] != nil }) else {
+            forumActionError = "One or more selected tags are no longer available."
+            return false
+        }
+        guard !channel.requiresForumTag || !uniqueTagIDs.isEmpty else {
+            forumActionError = "This forum requires every post to have at least one tag."
+            return false
+        }
+        if !canManageForumPosts {
+            let changedTagIDs = uniqueTagIDs.symmetricDifference(post.thread.appliedTagIDs)
+            guard changedTagIDs.allSatisfy({
+                availableTagsByID[$0]?.isModerated == false
+            }) else {
+                forumActionError = "Only moderators can change moderated tags."
+                return false
+            }
+        }
+        return true
     }
 
     func deleteForumPost(_ post: ForumPost) async {
@@ -1182,14 +1921,17 @@ extension AppModel {
             return
         }
         forumActionError = nil
+        let session = accountSession()
         do {
-            try await provider.deleteForumPost(post)
+            try await session.provider.deleteForumPost(post)
+            guard isCurrentAccountSession(session) else { return }
             removeForumPost(post.id)
             if openThread?.id == post.id {
                 closeThread()
             }
             forumActionError = nil
         } catch {
+            guard isCurrentAccountSession(session) else { return }
             forumActionError = error.localizedDescription
         }
     }

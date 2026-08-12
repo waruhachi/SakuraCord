@@ -260,7 +260,8 @@ private struct ThreadMessageTimelineView: View {
     let editRequest: MessageTimelineEditRequest?
     @State private var isNearBottom = false
     @State private var hasEstablishedInitialPosition = false
-    @State private var hasUserRequestedEarlierHistory = false
+    @State private var hasEarlierHistoryScrollIntent = false
+    @State private var isEarlierHistoryScrollGestureActive = false
     @State private var scrollRequest: MessageTimelineScrollRequest?
 
     var body: some View {
@@ -297,9 +298,7 @@ private struct ThreadMessageTimelineView: View {
             onScrollStateChange: handleScrollState,
             onInitialPositionEstablished: handleInitialPosition,
             onUserScrollBegan: handleUserScrollBegan,
-            onUserScrollEnded: { state in
-                isNearBottom = state.isNearBottom
-            }
+            onUserScrollEnded: handleUserScrollEnded
         )
         .scrollEdgeEffectStyle(.soft, for: .top)
         .ignoresSafeArea(.container, edges: .top)
@@ -308,7 +307,9 @@ private struct ThreadMessageTimelineView: View {
                 isLoading: model.isLoadingThread,
                 messageCount: model.threadMessages.count
             ) {
-                MessageTimelineLoadingSkeleton()
+                MessageTimelineLoadingSkeleton(
+                    bottomContentInset: bottomContentInset
+                )
             }
         }
         .overlay(alignment: .top) {
@@ -362,7 +363,8 @@ private struct ThreadMessageTimelineView: View {
             }
             isNearBottom = false
             hasEstablishedInitialPosition = false
-            hasUserRequestedEarlierHistory = false
+            hasEarlierHistoryScrollIntent = false
+            isEarlierHistoryScrollGestureActive = false
         }
         .onChange(of: model.conversationNewestRequest) { _, request in
             guard let request,
@@ -380,6 +382,7 @@ private struct ThreadMessageTimelineView: View {
             }
         }
         .onExitCommand {
+            guard !model.consumeEscapeForMediaViewer() else { return }
             if let conversationID {
                 model.completeConversationReadingAndAdvance(
                     channelID: conversationID
@@ -499,18 +502,27 @@ private struct ThreadMessageTimelineView: View {
 
     private func handleScrollState(_ state: TimelineScrollState) {
         isNearBottom = state.isNearBottom
+        let retainedHistoryIntent =
+            TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+                hasIntent: hasEarlierHistoryScrollIntent,
+                isGestureActive: isEarlierHistoryScrollGestureActive,
+                isInProvisionalHistory: state.isInProvisionalHistory
+            )
+        if hasEarlierHistoryScrollIntent != retainedHistoryIntent {
+            hasEarlierHistoryScrollIntent = retainedHistoryIntent
+        }
         if TimelineEarlierHistoryLoadingPolicy.shouldLoad(
             isNearTop: state.isNearTop,
+            contentFitsViewport: state.contentFitsViewport,
             allowsAutomaticLoading: true,
             hasMoreMessages: model.hasMoreThreadMessages,
             isLoading: model.isLoadingEarlierThread,
             hasUnresolvedUnreadBoundary:
                 hasUnresolvedInitialUnreadBoundary,
             hasUserScrollIntent:
-                hasUserRequestedEarlierHistory
+                hasEarlierHistoryScrollIntent
         )
         {
-            hasUserRequestedEarlierHistory = false
             loadEarlier()
         }
         guard state.hasEstablishedInitialPosition else { return }
@@ -528,11 +540,24 @@ private struct ThreadMessageTimelineView: View {
     }
 
     private func handleUserScrollBegan() {
+        isEarlierHistoryScrollGestureActive = true
         if hasUnresolvedInitialUnreadBoundary {
-            hasUserRequestedEarlierHistory = true
+            hasEarlierHistoryScrollIntent = true
         }
         guard let threadID = model.openThread?.id else { return }
         model.reportTimelineUserInteraction(channelID: threadID)
+    }
+
+    private func handleUserScrollEnded(_ state: TimelineScrollState) {
+        isEarlierHistoryScrollGestureActive = false
+        hasEarlierHistoryScrollIntent =
+            TimelineEarlierHistoryScrollIntentPolicy.shouldRetain(
+                hasIntent: hasEarlierHistoryScrollIntent,
+                isGestureActive: false,
+                isInProvisionalHistory: state.isInProvisionalHistory
+            )
+        isNearBottom = state.isNearBottom
+        handleScrollState(state)
     }
 
     private func requestScroll(_ target: MessageTimelineScrollRequest.Target) {

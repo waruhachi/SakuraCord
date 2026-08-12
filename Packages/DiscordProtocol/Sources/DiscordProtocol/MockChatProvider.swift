@@ -11,6 +11,7 @@ public actor MockChatProvider: ChatProvider {
     private var forumPostsByChannel: [ChannelID: [ForumPost]]
     private var profilesByUser: [UserID: UserProfile]
     private var privateCallsByChannel: [ChannelID: PrivateCall] = [:]
+    private var favoriteGIFValues: [GIFSearchResult] = []
     private var continuation: AsyncStream<ClientEvent>.Continuation?
     private var nextMessageID: UInt64
     public private(set) var typingRequests: [ChannelID] = []
@@ -25,6 +26,17 @@ public actor MockChatProvider: ChatProvider {
     }
 
     public private(set) var acknowledgementRequests: [AcknowledgementRequest] = []
+    public private(set) var bulkAcknowledgementRequests:
+        [[BulkReadStateAcknowledgement]] = []
+    private var bulkAckAcceptedPrefixBeforeFailure: Int?
+    public struct GuildNotificationRequest: Equatable, Sendable {
+        public var guildID: GuildID
+        public var level: MessageNotificationLevel?
+        public var isMuted: Bool?
+        public var muteEndTime: Date?
+    }
+
+    public private(set) var guildNotificationRequests: [GuildNotificationRequest] = []
     public struct ChannelNotificationRequest: Equatable, Sendable {
         public var guildID: GuildID?
         public var channelID: ChannelID
@@ -34,6 +46,16 @@ public actor MockChatProvider: ChatProvider {
     }
 
     public private(set) var channelNotificationRequests: [ChannelNotificationRequest] = []
+    public struct CategoryNotificationRequest: Equatable, Sendable {
+        public var guildID: GuildID
+        public var categoryID: ChannelID
+        public var level: MessageNotificationLevel?
+        public var isMuted: Bool?
+        public var muteEndTime: Date?
+        public var isCollapsed: Bool?
+    }
+
+    public private(set) var categoryNotificationRequests: [CategoryNotificationRequest] = []
     public struct ThreadNotificationRequest: Equatable, Sendable {
         public var threadID: ChannelID
         public var level: MessageNotificationLevel?
@@ -167,7 +189,12 @@ public actor MockChatProvider: ChatProvider {
                 "cry", "wilted_flower", "person_shrugging", "white_heart", "thumbsup", "x",
                 "unamused", "hot_face", "pleading_face", "smiley_cat", "eyes",
             ],
-            usageScores: [:]
+            usageScores: [:],
+            guildAndChannelUsageScores: Dictionary(
+                uniqueKeysWithValues: snapshot.channels.enumerated().map { index, channel in
+                    (channel.id.description, max(1, snapshot.channels.count - index))
+                }
+            )
         )
     }
 
@@ -246,6 +273,45 @@ public actor MockChatProvider: ChatProvider {
         )
     }
 
+    public func acknowledgeBulk(
+        _ readStates: [BulkReadStateAcknowledgement]
+    ) async throws {
+        bulkAcknowledgementRequests.append(readStates)
+        if let acceptedCount = bulkAckAcceptedPrefixBeforeFailure {
+            throw PartialBulkReadAcknowledgementError(
+                acceptedReadStates: Array(readStates.prefix(acceptedCount)),
+                failureDescription: "Synthetic later-batch failure"
+            )
+        }
+    }
+
+    public func failBulkAcknowledgement(afterAcceptedCount acceptedCount: Int) {
+        bulkAckAcceptedPrefixBeforeFailure = max(0, acceptedCount)
+    }
+
+    public func updateGuildNotificationLevel(
+        guildID: GuildID,
+        level: MessageNotificationLevel
+    ) async throws {
+        guildNotificationRequests.append(
+            GuildNotificationRequest(guildID: guildID, level: level)
+        )
+    }
+
+    public func updateGuildMute(
+        guildID: GuildID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {
+        guildNotificationRequests.append(
+            GuildNotificationRequest(
+                guildID: guildID,
+                isMuted: isMuted,
+                muteEndTime: until
+            )
+        )
+    }
+
     public func updateChannelMute(
         guildID: GuildID?,
         channelID: ChannelID,
@@ -258,6 +324,50 @@ public actor MockChatProvider: ChatProvider {
                 channelID: channelID,
                 isMuted: isMuted,
                 muteEndTime: until
+            )
+        )
+    }
+
+    public func updateCategoryNotificationLevel(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        level: MessageNotificationLevel
+    ) async throws {
+        categoryNotificationRequests.append(
+            CategoryNotificationRequest(
+                guildID: guildID,
+                categoryID: categoryID,
+                level: level
+            )
+        )
+    }
+
+    public func updateCategoryMute(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isMuted: Bool,
+        until: Date?
+    ) async throws {
+        categoryNotificationRequests.append(
+            CategoryNotificationRequest(
+                guildID: guildID,
+                categoryID: categoryID,
+                isMuted: isMuted,
+                muteEndTime: until
+            )
+        )
+    }
+
+    public func updateCategoryCollapsed(
+        guildID: GuildID,
+        categoryID: ChannelID,
+        isCollapsed: Bool
+    ) async throws {
+        categoryNotificationRequests.append(
+            CategoryNotificationRequest(
+                guildID: guildID,
+                categoryID: categoryID,
+                isCollapsed: isCollapsed
             )
         )
     }
@@ -750,12 +860,67 @@ public actor MockChatProvider: ChatProvider {
         return message
     }
 
+    public func forward(_ draft: ForwardMessageDraft) async throws -> Message {
+        guard snapshot.channels.contains(where: { $0.id == draft.destinationChannelID }) else {
+            throw ChatProviderError.channelNotFound
+        }
+        guard let source = messagesByChannel[draft.sourceChannelID]?.first(where: {
+            $0.id == draft.sourceMessageID
+        }) else {
+            throw ChatProviderError.messageNotFound
+        }
+        nextMessageID += 1
+        let forwardedSnapshot = ForwardedMessageSnapshot(
+            type: source.type,
+            content: source.content,
+            timestamp: source.timestamp,
+            editedTimestamp: source.editedTimestamp,
+            flags: source.flags,
+            attachments: source.attachments,
+            embeds: source.embeds,
+            components: source.components,
+            stickers: source.stickers,
+            mentionedUsers: source.mentionedUsers,
+            mentionedRoleIDs: source.mentionedRoleIDs
+        )
+        let message = Message(
+            id: MessageID(rawValue: nextMessageID),
+            channelID: draft.destinationChannelID,
+            author: currentUser,
+            content: forwardedSnapshot.content,
+            timestamp: .now,
+            editedTimestamp: forwardedSnapshot.editedTimestamp,
+            attachments: forwardedSnapshot.attachments,
+            nonce: draft.nonce,
+            type: forwardedSnapshot.type,
+            flags: forwardedSnapshot.flags,
+            guildID: snapshot.channels.first(where: {
+                $0.id == draft.destinationChannelID
+            })?.guildID,
+            embeds: forwardedSnapshot.embeds,
+            components: forwardedSnapshot.components,
+            stickers: forwardedSnapshot.stickers,
+            mentionedUsers: forwardedSnapshot.mentionedUsers,
+            mentionedRoleIDs: forwardedSnapshot.mentionedRoleIDs,
+            messageReference: DiscordMessageReference(
+                type: .forward,
+                messageID: draft.sourceMessageID,
+                channelID: draft.sourceChannelID,
+                guildID: draft.sourceGuildID
+            ),
+            forwardedSnapshot: forwardedSnapshot
+        )
+        messagesByChannel[draft.destinationChannelID, default: []].append(message)
+        continuation?.yield(.messageCreated(message))
+        return message
+    }
+
     public func supports(_ capability: ChatCapability) async -> Bool {
         capability == .forums || capability == .gifs || capability == .stickers
             || capability == .stickerSending
             || capability == .components || capability == .modals
             || capability == .remoteComponentChoices
-            || capability == .slashCommands
+            || capability == .slashCommands || capability == .messageForwarding
     }
 
     public func componentChoices(
@@ -1139,6 +1304,34 @@ public extension MockChatProvider {
         try Self.demoGIFs(query: query.isEmpty ? "GIF" : query)
     }
 
+    func gifPickerLanding() async throws -> GIFPickerLanding {
+        let preview = try Self.demoGIFs(query: "Category").first?.previewURL
+        return GIFPickerLanding(
+            categories: [
+                "hello", "lol", "love", "happy birthday", "thank you", "excited",
+                "yes", "no", "sorry", "happy", "sad", "thumbs up",
+            ]
+                .map {
+                    GIFPickerCategory(id: $0, name: $0, query: $0, previewURL: preview)
+                },
+            trendingPreviewURL: preview
+        )
+    }
+
+    func favoriteGIFs() async throws -> [GIFSearchResult] {
+        favoriteGIFValues
+    }
+
+    func setGIFFavorite(_ gif: GIFSearchResult, isFavorite: Bool) async throws
+        -> [GIFSearchResult]
+    {
+        favoriteGIFValues.removeAll { $0.url == gif.url }
+        if isFavorite {
+            favoriteGIFValues.insert(gif, at: 0)
+        }
+        return favoriteGIFValues
+    }
+
     func stickers(in guildID: GuildID) async throws -> [MessageSticker] {
         try [
             MessageSticker(
@@ -1161,12 +1354,20 @@ public extension MockChatProvider {
             )!
             try data.write(to: url, options: .atomic)
         }
-        return [
-            GIFSearchResult(
-                id: "demo-gif", title: "\(query) demo", url: url, previewURL: url, width: 1,
-                height: 1
+        let sizes = [(640, 640), (498, 210), (374, 352), (498, 498), (200, 150), (640, 492)]
+        return (0 ..< 50).map { index in
+            let size = sizes[index % sizes.count]
+            return GIFSearchResult(
+                id: "demo-gif-\(index)",
+                title: "\(query) demo \(index + 1)",
+                url: URL(string: "https://example.invalid/mock-gif/\(index)")!,
+                previewURL: url,
+                width: size.0,
+                height: size.1,
+                thumbnailURL: url,
+                mediaURL: url
             )
-        ]
+        }
     }
 
     private static func stageAttachment(_ sourceURL: URL, messageID: UInt64, index: Int) throws

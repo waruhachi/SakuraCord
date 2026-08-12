@@ -5,12 +5,10 @@ import Testing
 
 @Suite(.serialized)
 struct DiscordSessionAuthenticatorTests {
-    @Test func `cold password login matches fingerprint login and validation contract`() async throws {
+    @Test func `cold password login stops before gateway identity and persistence`() async throws {
         AuthenticationURLProtocol.reset(mode: .passwordSuccess)
-        let store = AuthenticationCredentialStore()
         let fingerprints = TestFingerprintStore()
         let authenticator = DiscordSessionAuthenticator(
-            credentials: store,
             session: Self.session(),
             fingerprints: fingerprints
         )
@@ -20,30 +18,165 @@ struct DiscordSessionAuthenticatorTests {
             password: "correct horse battery staple"
         )
 
-        #expect(step == .authenticated(CredentialHandle(accountID: "123456789012345678")))
+        let credential = try #require({
+            if case let .authenticated(credential) = step {
+                return credential
+            }
+            return nil
+        }())
         #expect(AuthenticationURLProtocol.paths == [
+            "/api/v9/apex/experiments",
             "/api/v9/experiments",
-            "/api/v9/auth/login",
-            "/api/v9/users/@me"
+            "/api/v9/auth/login"
         ])
+        #expect(AuthenticationURLProtocol.apexQuery == ["surface": "2"])
+        #expect(AuthenticationURLProtocol.apexInstallationID == nil)
+        #expect(AuthenticationURLProtocol.experimentsQuery == ["with_guild_experiments": "true"])
+        #expect(AuthenticationURLProtocol.experimentsInstallationID == "server-issued-installation")
+        #expect(AuthenticationURLProtocol.experimentsContext == DiscordSessionAuthenticatorTests.loginContext)
         #expect(AuthenticationURLProtocol.loginBody?["login"] as? String == "person@example.com")
         #expect(AuthenticationURLProtocol.loginBody?["password"] as? String == "correct horse battery staple")
         #expect(AuthenticationURLProtocol.loginBody?["undelete"] as? Bool == false)
+        #expect(AuthenticationURLProtocol.loginBody?["login_source"] is NSNull)
+        #expect(AuthenticationURLProtocol.loginBody?["gift_code_sku_id"] is NSNull)
         #expect(AuthenticationURLProtocol.loginFingerprint == "server-issued-fingerprint")
+        #expect(AuthenticationURLProtocol.loginInstallationID == "server-issued-installation")
         #expect(AuthenticationURLProtocol.loginAuthorization == nil)
-        #expect(AuthenticationURLProtocol.validationAuthorization == "test-session-credential-value")
-        #expect(AuthenticationURLProtocol.validationFingerprint == "server-issued-fingerprint")
+        #expect(AuthenticationURLProtocol.loginHost == "discordapp.com")
+        #expect(AuthenticationURLProtocol.loginReferer == "https://discordapp.com/login")
+        #expect(AuthenticationURLProtocol.loginOrigin == "https://discordapp.com")
+        #expect(AuthenticationURLProtocol.loginSuperProperties?["client_heartbeat_session_id"] == nil)
+        #expect(AuthenticationURLProtocol.loginSuperProperties?["native_build_number"] as? Int == 87_263)
+        #expect(AuthenticationURLProtocol.loginSuperProperties?["client_version"] as? String == "0.0.403")
+        #expect(AuthenticationURLProtocol.loginSuperProperties?["browser_version"] as? String == "42.7.1")
         #expect(AuthenticationURLProtocol.superPropertiesCount == 3)
         #expect(await fingerprints.load() == "server-issued-fingerprint")
-        #expect(await store.storedAccountID == "123456789012345678")
+        #expect(await fingerprints.loadInstallationID() == "server-issued-installation")
+        await credential.discard()
     }
 
-    @Test func `mfa uses issued ticket method and login instance then validates once`() async throws {
+    @Test func `cold password login falls back when apex omits installation`() async throws {
+        AuthenticationURLProtocol.reset(mode: .apexMissingInstallation)
+        let fingerprints = TestFingerprintStore()
+        let authenticator = DiscordSessionAuthenticator(
+            session: Self.session(),
+            fingerprints: fingerprints
+        )
+
+        let step = try await authenticator.login(
+            identifier: "person@example.com",
+            password: "correct horse battery staple"
+        )
+
+        let credential = try #require({
+            if case let .authenticated(credential) = step {
+                return credential
+            }
+            return nil
+        }())
+        #expect(AuthenticationURLProtocol.paths == [
+            "/api/v9/apex/experiments",
+            "/api/v9/experiments",
+            "/api/v9/auth/login"
+        ])
+        #expect(AuthenticationURLProtocol.experimentsInstallationID == nil)
+        #expect(AuthenticationURLProtocol.loginFingerprint == "server-issued-fingerprint")
+        #expect(AuthenticationURLProtocol.loginInstallationID == "fallback-installation")
+        #expect(await fingerprints.load() == "server-issued-fingerprint")
+        #expect(await fingerprints.loadInstallationID() == "fallback-installation")
+        await credential.discard()
+    }
+
+    @Test func `stored public release fingerprint uses installation fallback`() async throws {
+        AuthenticationURLProtocol.reset(mode: .apexMissingInstallation)
+        let fingerprints = TestFingerprintStore(
+            value: "existing-fingerprint",
+            installationID: ""
+        )
+        let authenticator = DiscordSessionAuthenticator(
+            session: Self.session(),
+            fingerprints: fingerprints
+        )
+
+        let step = try await authenticator.login(
+            identifier: "person@example.com",
+            password: "correct horse battery staple"
+        )
+
+        let credential = try #require({
+            if case let .authenticated(credential) = step {
+                return credential
+            }
+            return nil
+        }())
+        #expect(AuthenticationURLProtocol.paths == [
+            "/api/v9/apex/experiments",
+            "/api/v9/experiments",
+            "/api/v9/auth/login"
+        ])
+        #expect(AuthenticationURLProtocol.experimentsInstallationID == nil)
+        #expect(AuthenticationURLProtocol.loginFingerprint == "existing-fingerprint")
+        #expect(AuthenticationURLProtocol.loginInstallationID == "fallback-installation")
+        #expect(await fingerprints.load() == "existing-fingerprint")
+        #expect(await fingerprints.loadInstallationID() == "fallback-installation")
+        await credential.discard()
+    }
+
+    @Test func `cold password login proceeds when installation is omitted`() async throws {
+        AuthenticationURLProtocol.reset(mode: .installationMissing)
+        let fingerprints = TestFingerprintStore()
+        let authenticator = DiscordSessionAuthenticator(
+            session: Self.session(),
+            fingerprints: fingerprints
+        )
+
+        let step = try await authenticator.login(
+            identifier: "person@example.com",
+            password: "correct horse battery staple"
+        )
+        let credential = try #require({
+            if case let .authenticated(credential) = step {
+                return credential
+            }
+            return nil
+        }())
+
+        #expect(AuthenticationURLProtocol.paths == [
+            "/api/v9/apex/experiments",
+            "/api/v9/experiments",
+            "/api/v9/auth/login"
+        ])
+        #expect(AuthenticationURLProtocol.loginFingerprint == "server-issued-fingerprint")
+        #expect(AuthenticationURLProtocol.loginInstallationID == nil)
+        #expect(await fingerprints.load() == "server-issued-fingerprint")
+        #expect(await fingerprints.loadInstallationID() == nil)
+        await credential.discard()
+    }
+
+    @Test func `installation fallback preserves experiments HTTP failure`() async throws {
+        AuthenticationURLProtocol.reset(mode: .installationFallbackRejected)
+        let authenticator = DiscordSessionAuthenticator(
+            session: Self.session(),
+            fingerprints: TestFingerprintStore()
+        )
+
+        await #expect(throws: AuthenticationError.transport(status: 403)) {
+            try await authenticator.login(
+                identifier: "person@example.com",
+                password: "correct horse battery staple"
+            )
+        }
+
+        #expect(AuthenticationURLProtocol.paths == [
+            "/api/v9/apex/experiments",
+            "/api/v9/experiments"
+        ])
+    }
+
+    @Test func `mfa uses issued ticket and stops before gateway identity`() async throws {
         AuthenticationURLProtocol.reset(mode: .mfaSuccess)
-        let store = AuthenticationCredentialStore()
         let fingerprints = TestFingerprintStore(value: "existing-fingerprint")
         let authenticator = DiscordSessionAuthenticator(
-            credentials: store,
             session: Self.session(),
             fingerprints: fingerprints
         )
@@ -60,28 +193,29 @@ struct DiscordSessionAuthenticatorTests {
         }())
         #expect(challenge.methods == [.totp, .backup])
 
-        let handle = try await authenticator.completeMFA(
+        let credential = try await authenticator.completeMFA(
             challenge: challenge,
             method: .totp,
             code: "123 456"
         )
 
-        #expect(handle.accountID == "123456789012345678")
         #expect(AuthenticationURLProtocol.paths == [
             "/api/v9/auth/login",
-            "/api/v9/auth/mfa/totp",
-            "/api/v9/users/@me"
+            "/api/v9/auth/mfa/totp"
         ])
         #expect(AuthenticationURLProtocol.mfaBody?["code"] as? String == "123456")
         #expect(AuthenticationURLProtocol.mfaBody?["ticket"] as? String == "mfa-ticket")
         #expect(AuthenticationURLProtocol.mfaBody?["login_instance_id"] as? String == "login-instance")
+        #expect(AuthenticationURLProtocol.mfaBody?["login_source"] is NSNull)
+        #expect(AuthenticationURLProtocol.mfaBody?["gift_code_sku_id"] is NSNull)
         #expect(AuthenticationURLProtocol.mfaFingerprint == "existing-fingerprint")
+        #expect(AuthenticationURLProtocol.mfaInstallationID == "existing-installation")
+        await credential.discard()
     }
 
     @Test func `captcha replays once with paicord challenge headers`() async throws {
         AuthenticationURLProtocol.reset(mode: .captchaThenSuccess)
         let authenticator = DiscordSessionAuthenticator(
-            credentials: AuthenticationCredentialStore(),
             session: Self.session(),
             fingerprints: TestFingerprintStore(value: "existing-fingerprint")
         )
@@ -103,22 +237,43 @@ struct DiscordSessionAuthenticatorTests {
             solutionToken: "user-completed-solution"
         )
 
-        #expect(secondStep == .authenticated(CredentialHandle(accountID: "123456789012345678")))
+        let credential = try #require({
+            if case let .authenticated(credential) = secondStep {
+                return credential
+            }
+            return nil
+        }())
         #expect(AuthenticationURLProtocol.paths == [
             "/api/v9/auth/login",
-            "/api/v9/auth/login",
-            "/api/v9/users/@me"
+            "/api/v9/auth/login"
         ])
         #expect(AuthenticationURLProtocol.captchaKey == "user-completed-solution")
         #expect(AuthenticationURLProtocol.captchaRQToken == "request-token")
         #expect(AuthenticationURLProtocol.captchaSessionID == "captcha-session")
+        await credential.discard()
     }
 
-    @Test func `remote auth exchanges one ticket then validates and stores once`() async throws {
-        AuthenticationURLProtocol.reset(mode: .remoteAuthSuccess)
-        let store = AuthenticationCredentialStore()
+    @Test func `password login stops at the current official three attempt budget`() async throws {
+        AuthenticationURLProtocol.reset(mode: .loginServerFailure)
         let authenticator = DiscordSessionAuthenticator(
-            credentials: store,
+            session: Self.session(),
+            fingerprints: TestFingerprintStore(value: "existing-fingerprint")
+        )
+
+        await #expect(throws: AuthenticationError.transport(status: 500)) {
+            try await authenticator.login(
+                identifier: "person@example.com",
+                password: "correct horse battery staple"
+            )
+        }
+
+        #expect(AuthenticationURLProtocol.loginRequestCount == 3)
+        #expect(AuthenticationURLProtocol.paths == Array(repeating: "/api/v9/auth/login", count: 3))
+    }
+
+    @Test func `remote auth exchanges one ticket then waits for gateway identity`() async throws {
+        AuthenticationURLProtocol.reset(mode: .remoteAuthSuccess)
+        let authenticator = DiscordSessionAuthenticator(
             session: Self.session(),
             fingerprints: TestFingerprintStore(value: "existing-fingerprint")
         )
@@ -131,24 +286,17 @@ struct DiscordSessionAuthenticatorTests {
             return nil
         }())
         #expect(encryptedToken == "encrypted-token-fixture")
-        let handle = try await authenticator.acceptRemoteAuthToken("remote-session-credential-value")
+        let credential = try await authenticator.acceptRemoteAuthToken("remote-session-credential-value")
 
-        #expect(handle.accountID == "123456789012345678")
-        #expect(AuthenticationURLProtocol.paths == [
-            "/api/v9/users/@me/remote-auth/login",
-            "/api/v9/users/@me"
-        ])
+        #expect(AuthenticationURLProtocol.paths == ["/api/v9/users/@me/remote-auth/login"])
         #expect(AuthenticationURLProtocol.remoteAuthBody?["ticket"] as? String == "approved-ticket")
         #expect(AuthenticationURLProtocol.remoteAuthAuthorization == nil)
-        #expect(AuthenticationURLProtocol.validationAuthorization == "remote-session-credential-value")
-        #expect(AuthenticationURLProtocol.validationFingerprint == "existing-fingerprint")
-        #expect(await store.storedAccountID == "123456789012345678")
+        await credential.discard()
     }
 
     @Test func `remote auth captcha replays ticket once with paicord challenge headers`() async throws {
         AuthenticationURLProtocol.reset(mode: .remoteAuthCaptchaThenSuccess)
         let authenticator = DiscordSessionAuthenticator(
-            credentials: AuthenticationCredentialStore(),
             session: Self.session(),
             fingerprints: TestFingerprintStore(value: "existing-fingerprint")
         )
@@ -183,7 +331,6 @@ struct DiscordSessionAuthenticatorTests {
     @Test func `remote auth does not replay A second captcha challenge`() async throws {
         AuthenticationURLProtocol.reset(mode: .remoteAuthCaptchaTwice)
         let authenticator = DiscordSessionAuthenticator(
-            credentials: AuthenticationCredentialStore(),
             session: Self.session(),
             fingerprints: TestFingerprintStore(value: "existing-fingerprint")
         )
@@ -214,13 +361,17 @@ struct DiscordSessionAuthenticatorTests {
         configuration.protocolClasses = [AuthenticationURLProtocol.self]
         return URLSession(configuration: configuration)
     }
+
+    private static let loginContext = Data(#"{"location":"Login"}"#.utf8).base64EncodedString()
 }
 
 private actor TestFingerprintStore: DiscordFingerprintStoring {
     private var value: String?
+    private var installationID: String?
 
-    init(value: String? = nil) {
+    init(value: String? = nil, installationID: String? = nil) {
         self.value = value
+        self.installationID = installationID ?? (value == nil ? nil : "existing-installation")
     }
 
     func load() -> String? {
@@ -230,31 +381,25 @@ private actor TestFingerprintStore: DiscordFingerprintStoring {
     func save(_ fingerprint: String) {
         value = fingerprint
     }
-}
 
-private actor AuthenticationCredentialStore: CredentialStore {
-    private(set) var storedAccountID: String?
-
-    func store(_ credential: Data, accountID: String) async throws -> CredentialHandle {
-        storedAccountID = accountID
-        return CredentialHandle(accountID: accountID)
+    func loadInstallationID() async -> String? {
+        installationID
     }
 
-    func credential(for handle: CredentialHandle) async throws -> Data {
-        Data()
-    }
-
-    func remove(_ handle: CredentialHandle) async throws {}
-    func handles() async throws -> [CredentialHandle] {
-        []
+    func saveInstallationID(_ installationID: String) async {
+        self.installationID = installationID
     }
 }
 
 private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable {
     enum Mode {
         case passwordSuccess
+        case apexMissingInstallation
+        case installationMissing
+        case installationFallbackRejected
         case mfaSuccess
         case captchaThenSuccess
+        case loginServerFailure
         case remoteAuthSuccess
         case remoteAuthCaptchaThenSuccess
         case remoteAuthCaptchaTwice
@@ -262,13 +407,22 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
 
     nonisolated(unsafe) static var mode = Mode.passwordSuccess
     nonisolated(unsafe) static var paths: [String] = []
+    nonisolated(unsafe) static var apexQuery: [String: String] = [:]
+    nonisolated(unsafe) static var apexInstallationID: String?
+    nonisolated(unsafe) static var experimentsQuery: [String: String] = [:]
+    nonisolated(unsafe) static var experimentsInstallationID: String?
+    nonisolated(unsafe) static var experimentsContext: String?
     nonisolated(unsafe) static var loginBody: [String: Any]?
     nonisolated(unsafe) static var mfaBody: [String: Any]?
     nonisolated(unsafe) static var loginFingerprint: String?
     nonisolated(unsafe) static var mfaFingerprint: String?
-    nonisolated(unsafe) static var validationFingerprint: String?
+    nonisolated(unsafe) static var loginInstallationID: String?
+    nonisolated(unsafe) static var mfaInstallationID: String?
     nonisolated(unsafe) static var loginAuthorization: String?
-    nonisolated(unsafe) static var validationAuthorization: String?
+    nonisolated(unsafe) static var loginHost: String?
+    nonisolated(unsafe) static var loginReferer: String?
+    nonisolated(unsafe) static var loginOrigin: String?
+    nonisolated(unsafe) static var loginSuperProperties: [String: Any]?
     nonisolated(unsafe) static var superPropertiesCount = 0
     nonisolated(unsafe) static var loginRequestCount = 0
     nonisolated(unsafe) static var captchaKey: String?
@@ -284,13 +438,22 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
     static func reset(mode: Mode) {
         self.mode = mode
         paths = []
+        apexQuery = [:]
+        apexInstallationID = nil
+        experimentsQuery = [:]
+        experimentsInstallationID = nil
+        experimentsContext = nil
         loginBody = nil
         mfaBody = nil
         loginFingerprint = nil
         mfaFingerprint = nil
-        validationFingerprint = nil
+        loginInstallationID = nil
+        mfaInstallationID = nil
         loginAuthorization = nil
-        validationAuthorization = nil
+        loginHost = nil
+        loginReferer = nil
+        loginOrigin = nil
+        loginSuperProperties = nil
         superPropertiesCount = 0
         loginRequestCount = 0
         captchaKey = nil
@@ -322,21 +485,49 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
         let status: Int
         let body: String
         switch path {
-        case "/api/v9/experiments":
+        case "/api/v9/apex/experiments":
+            Self.apexQuery = Self.query(from: request)
+            Self.apexInstallationID = request.value(forHTTPHeaderField: "X-Installation-ID")
             status = 200
-            body = #"{"fingerprint":"server-issued-fingerprint"}"#
+            switch Self.mode {
+            case .apexMissingInstallation, .installationMissing, .installationFallbackRejected:
+                body = #"{"assignments":{}}"#
+            default:
+                body = #"{"installation":"server-issued-installation","assignments":{}}"#
+            }
+        case "/api/v9/experiments":
+            Self.experimentsQuery = Self.query(from: request)
+            Self.experimentsInstallationID = request.value(forHTTPHeaderField: "X-Installation-ID")
+            Self.experimentsContext = request.value(forHTTPHeaderField: "X-Context-Properties")
+            if Self.mode == .installationFallbackRejected {
+                status = 403
+                body = #"{"message":"request rejected"}"#
+            } else {
+                status = 200
+                let installation = Self.mode == .installationMissing
+                    ? ""
+                    : #","installation":"fallback-installation""#
+                body = #"{"fingerprint":"server-issued-fingerprint","assignments":[],"guild_experiments":[]"#
+                    + installation + "}"
+            }
         case "/api/v9/auth/login":
             Self.loginRequestCount += 1
             Self.loginBody = Self.bodyData(from: request).flatMap {
                 try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
             }
             Self.loginFingerprint = request.value(forHTTPHeaderField: "X-Fingerprint")
+            Self.loginInstallationID = request.value(forHTTPHeaderField: "X-Installation-ID")
             Self.loginAuthorization = request.value(forHTTPHeaderField: "Authorization")
+            Self.loginHost = request.url?.host
+            Self.loginReferer = request.value(forHTTPHeaderField: "Referer")
+            Self.loginOrigin = request.value(forHTTPHeaderField: "Origin")
+            Self.loginSuperProperties = Self.superProperties(from: request)
             Self.captchaKey = request.value(forHTTPHeaderField: "X-Captcha-Key")
             Self.captchaRQToken = request.value(forHTTPHeaderField: "X-Captcha-Rqtoken")
             Self.captchaSessionID = request.value(forHTTPHeaderField: "X-Captcha-Session-Id")
             switch Self.mode {
-            case .passwordSuccess:
+            case .passwordSuccess, .apexMissingInstallation, .installationMissing,
+                 .installationFallbackRejected:
                 status = 200
                 body = #"{"token":"test-session-credential-value"}"#
             case .mfaSuccess:
@@ -350,6 +541,9 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
                     status = 200
                     body = #"{"token":"test-session-credential-value"}"#
                 }
+            case .loginServerFailure:
+                status = 500
+                body = #"{"message":"temporary server failure"}"#
             case .remoteAuthSuccess, .remoteAuthCaptchaThenSuccess, .remoteAuthCaptchaTwice:
                 status = 500
                 body = #"{"message":"unexpected login call"}"#
@@ -377,13 +571,9 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
                 try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
             }
             Self.mfaFingerprint = request.value(forHTTPHeaderField: "X-Fingerprint")
+            Self.mfaInstallationID = request.value(forHTTPHeaderField: "X-Installation-ID")
             status = 200
             body = #"{"token":"test-session-credential-value"}"#
-        case "/api/v9/users/@me":
-            Self.validationAuthorization = request.value(forHTTPHeaderField: "Authorization")
-            Self.validationFingerprint = request.value(forHTTPHeaderField: "X-Fingerprint")
-            status = 200
-            body = #"{"id":"123456789012345678"}"#
         default:
             status = 404
             body = #"{"message":"not found"}"#
@@ -420,5 +610,21 @@ private final class AuthenticationURLProtocol: URLProtocol, @unchecked Sendable 
             data.append(buffer, count: count)
         }
         return data
+    }
+
+    private static func query(from request: URLRequest) -> [String: String] {
+        guard let url = request.url,
+              let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        else { return [:] }
+        return Dictionary(uniqueKeysWithValues: items.compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
+    }
+
+    private static func superProperties(from request: URLRequest) -> [String: Any]? {
+        guard let header = request.value(forHTTPHeaderField: "X-Super-Properties"),
+              let data = Data(base64Encoded: header)
+        else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 }

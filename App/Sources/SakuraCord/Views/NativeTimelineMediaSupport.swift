@@ -8,24 +8,285 @@ import QuartzCore
 import SakuraCordModels
 import SwiftUI
 
+nonisolated enum NativeTimelineMediaMemoryPolicy {
+    static let sharedStaticImageBytes = 32 * 1_024 * 1_024
+    static let timelineImageBytes = 32 * 1_024 * 1_024
+    static let pinnedImageBytes = 16 * 1_024 * 1_024
+    static let sharedAnimatedImageBytes = 24 * 1_024 * 1_024
+    static let displayedAnimatedImageBytes = 16 * 1_024 * 1_024
+    static let timelineAnimatedImageBytes = 16 * 1_024 * 1_024
+    static let rowBitmapBytes = 12 * 1_024 * 1_024
+
+    /// Explicit cost limits for decoded image and row-bitmap caches. This does
+    /// not claim to include encoded media data, Lottie objects, decoder
+    /// temporaries, or AVFoundation buffers.
+    static let decodedImageCacheBytes =
+        sharedStaticImageBytes
+        + timelineImageBytes
+        + pinnedImageBytes
+        + sharedAnimatedImageBytes
+        + displayedAnimatedImageBytes
+        + timelineAnimatedImageBytes
+        + rowBitmapBytes
+
+    static let declaredMemoryCacheBytes =
+        decodedImageCacheBytes + SharedMediaDataMemoryPolicy.retainedBytes
+}
+
 struct NativeTimelineMediaKey: Hashable {
     let url: URL
+    let fallbackURL: URL?
     let maximumPixelDimension: Int
 
     static func avatar(_ url: URL) -> Self {
-        Self(url: url, maximumPixelDimension: 96)
+        Self(url: url, fallbackURL: nil, maximumPixelDimension: 96)
     }
 
     static func avatarDecoration(_ url: URL) -> Self {
-        Self(url: url, maximumPixelDimension: 128)
+        Self(url: url, fallbackURL: nil, maximumPixelDimension: 128)
     }
 
-    static func media(_ url: URL, maximumPixelDimension: Int = 1_024) -> Self {
-        Self(url: url, maximumPixelDimension: maximumPixelDimension)
+    static func media(
+        _ url: URL,
+        fallbackURL: URL? = nil,
+        maximumPixelDimension: Int = 1_024
+    ) -> Self {
+        Self(
+            url: url,
+            fallbackURL: fallbackURL == url ? nil : fallbackURL,
+            maximumPixelDimension: maximumPixelDimension
+        )
+    }
+
+    static func attachment(_ attachment: Attachment) -> Self? {
+        switch attachment.mediaKind {
+        case .image, .animatedImage:
+            let displayURL = attachment.proxyURL ?? attachment.url
+            return .media(
+                displayURL,
+                fallbackURL: displayURL == attachment.url
+                    ? nil
+                    : attachment.url
+            )
+        case .video, .audio, .file:
+            return nil
+        }
     }
 
     var cacheKey: NSString {
-        "\(url.absoluteString)#native-timeline-pixel-max=\(maximumPixelDimension)" as NSString
+        let fallback = fallbackURL?.absoluteString ?? ""
+        return "\(url.absoluteString)#fallback=\(fallback)#native-timeline-pixel-max=\(maximumPixelDimension)"
+            as NSString
+    }
+
+    var loadURLs: [URL] {
+        if let fallbackURL, fallbackURL != url {
+            return [url, fallbackURL]
+        }
+        return [url]
+    }
+}
+
+nonisolated final class SharedDecodedImageBox: NSObject, @unchecked Sendable {
+    let image: CGImage
+    let cost: Int
+
+    init(_ image: CGImage) {
+        self.image = image
+        cost = max(1, image.bytesPerRow * image.height)
+    }
+}
+
+actor SharedDecodedImageLoader {
+    static let shared = SharedDecodedImageLoader()
+
+    private struct InFlightRequest {
+        let id: UUID
+        let task: Task<CGImage?, Never>
+        var waiterIDs: Set<UUID>
+        var priority: MediaLoadPriority
+    }
+
+    struct RequestKey: Hashable, Sendable {
+        let url: URL
+        let maximumPixelDimension: Int
+
+        var cacheKey: NSString {
+            "\(url.absoluteString)#shared-static-pixel-max=\(maximumPixelDimension)"
+                as NSString
+        }
+    }
+
+    private let cache: NSCache<NSString, SharedDecodedImageBox> = {
+        let cache = NSCache<NSString, SharedDecodedImageBox>()
+        cache.totalCostLimit =
+            NativeTimelineMediaMemoryPolicy.sharedStaticImageBytes
+        cache.countLimit = 256
+        return cache
+    }()
+    private var inFlight: [RequestKey: InFlightRequest] = [:]
+    private let dataLoader: SharedMediaDataLoader
+    private let decodeScheduler: NativeTimelineMediaDecodeScheduler
+
+    init(
+        dataLoader: SharedMediaDataLoader = .shared,
+        decodeScheduler: NativeTimelineMediaDecodeScheduler = .shared
+    ) {
+        self.dataLoader = dataLoader
+        self.decodeScheduler = decodeScheduler
+    }
+
+    func image(
+        for url: URL,
+        maximumPixelDimension: Int,
+        priority: MediaLoadPriority
+    ) async -> CGImage? {
+        let key = RequestKey(
+            url: url,
+            maximumPixelDimension: max(1, maximumPixelDimension)
+        )
+        if let cached = cache.object(forKey: key.cacheKey) {
+            return cached.image
+        }
+
+        let waiterID = UUID()
+        let requestID: UUID
+        let task: Task<CGImage?, Never>
+        if var request = inFlight[key] {
+            request.waiterIDs.insert(waiterID)
+            let promotesToVisible =
+                priority == .visible && request.priority == .prefetch
+            if promotesToVisible {
+                request.priority = .visible
+            }
+            inFlight[key] = request
+            if promotesToVisible {
+                await dataLoader.promoteRemoteLoad(for: url)
+                await decodeScheduler.promoteWaiter(request.id)
+            }
+            requestID = request.id
+            task = request.task
+        } else {
+            let createdRequestID = UUID()
+            requestID = createdRequestID
+            let dataLoader = self.dataLoader
+            let decodeScheduler = self.decodeScheduler
+            task = Task { [weak self] in
+                do {
+                    let data = try await dataLoader.data(
+                        for: url,
+                        priority: priority
+                    )
+                    try Task.checkCancellation()
+                    let effectivePriority = await self?.priority(
+                        for: key,
+                        requestID: createdRequestID
+                    ) ?? priority
+                    return await decodeScheduler.decode(
+                        data,
+                        maximumPixelDimension: key.maximumPixelDimension,
+                        priority: effectivePriority,
+                        waiterID: createdRequestID
+                    )
+                } catch {
+                    return nil
+                }
+            }
+            inFlight[key] = InFlightRequest(
+                id: requestID,
+                task: task,
+                waiterIDs: [waiterID],
+                priority: priority
+            )
+        }
+
+        let image = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            Task {
+                await self.cancelWaiter(
+                    waiterID,
+                    requestID: requestID,
+                    for: key
+                )
+            }
+        }
+        if Task.isCancelled {
+            cancelWaiter(waiterID, requestID: requestID, for: key)
+            return nil
+        }
+        return finishWaiter(
+            waiterID,
+            requestID: requestID,
+            for: key,
+            image: image
+        )
+    }
+
+    func promoteImageLoad(
+        for url: URL,
+        maximumPixelDimension: Int
+    ) async {
+        let key = RequestKey(
+            url: url,
+            maximumPixelDimension: max(1, maximumPixelDimension)
+        )
+        guard var request = inFlight[key],
+              request.priority == .prefetch
+        else { return }
+        request.priority = .visible
+        inFlight[key] = request
+        await dataLoader.promoteRemoteLoad(for: url)
+        await decodeScheduler.promoteWaiter(request.id)
+    }
+
+    private func priority(
+        for key: RequestKey,
+        requestID: UUID
+    ) -> MediaLoadPriority? {
+        guard let request = inFlight[key], request.id == requestID else {
+            return nil
+        }
+        return request.priority
+    }
+
+    private func cancelWaiter(
+        _ waiterID: UUID,
+        requestID: UUID,
+        for key: RequestKey
+    ) {
+        guard var request = inFlight[key],
+              request.id == requestID,
+              request.waiterIDs.remove(waiterID) != nil
+        else { return }
+        if request.waiterIDs.isEmpty {
+            inFlight[key] = nil
+            request.task.cancel()
+        } else {
+            inFlight[key] = request
+        }
+    }
+
+    private func finishWaiter(
+        _ waiterID: UUID,
+        requestID: UUID,
+        for key: RequestKey,
+        image: CGImage?
+    ) -> CGImage? {
+        guard var request = inFlight[key],
+              request.id == requestID,
+              request.waiterIDs.remove(waiterID) != nil
+        else { return nil }
+        if request.waiterIDs.isEmpty {
+            inFlight[key] = nil
+        } else {
+            inFlight[key] = request
+        }
+        if let image {
+            let box = SharedDecodedImageBox(image)
+            cache.setObject(box, forKey: key.cacheKey, cost: box.cost)
+        }
+        return image
     }
 }
 
@@ -62,6 +323,23 @@ final class NativeTimelineAnimatedMedia {
 final class NativeTimelineMediaStore {
     static let shared = NativeTimelineMediaStore()
 
+    typealias DecodedImageLoad = (
+        URL,
+        Int,
+        MediaLoadPriority
+    ) async -> CGImage?
+    typealias DecodedImagePromotion = (URL, Int) async -> Void
+
+    struct AnimatedSubscriberID: Hashable {
+        let owner: UUID
+        let row: NativeMessageTimelineItem.Identifier
+    }
+
+    struct StaticSubscriberID: Hashable {
+        let owner: UUID
+        let row: NativeMessageTimelineItem.Identifier
+    }
+
     struct CachedImage {
         let image: NSImage
         let cost: Int
@@ -73,9 +351,11 @@ final class NativeTimelineMediaStore {
         var ownerCount: Int
     }
 
-    static let imageCacheCostLimit = 48 * 1_024 * 1_024
+    static let imageCacheCostLimit =
+        NativeTimelineMediaMemoryPolicy.timelineImageBytes
     static let imageCacheCountLimit = 192
-    static let pinnedImageCostLimit = 32 * 1_024 * 1_024
+    static let pinnedImageCostLimit =
+        NativeTimelineMediaMemoryPolicy.pinnedImageBytes
 
     // NSCache may discard every decoded image during ordinary memory pressure,
     // even while a cached row bitmap is still on screen. Hovering that row
@@ -88,17 +368,25 @@ final class NativeTimelineMediaStore {
     var visibleKeysByOwner:
         [UUID: Set<NativeTimelineMediaKey>] = [:]
     var loading: Set<NativeTimelineMediaKey> = []
+    var loadingPriorities: [NativeTimelineMediaKey: MediaLoadPriority] = [:]
+    var loadingTaskIDs: [NativeTimelineMediaKey: UUID] = [:]
+    var loadingTasks: [NativeTimelineMediaKey: Task<Void, Never>] = [:]
     var subscribers:
-        [NativeTimelineMediaKey: [NativeMessageTimelineItem.Identifier: () -> Void]] = [:]
+        [NativeTimelineMediaKey:
+            [StaticSubscriberID: (NativeTimelineStaticMediaLoadOutcome) -> Void]] = [:]
     let animatedCache: NSCache<NSString, NativeTimelineAnimatedMedia> = {
         let cache = NSCache<NSString, NativeTimelineAnimatedMedia>()
         cache.countLimit = 32
-        cache.totalCostLimit = 32 * 1_024 * 1_024
+        cache.totalCostLimit =
+            NativeTimelineMediaMemoryPolicy.timelineAnimatedImageBytes
         return cache
     }()
     var animatedLoading: Set<NativeTimelineMediaKey> = []
+    var animatedLoadingTaskIDs: [NativeTimelineMediaKey: UUID] = [:]
+    var animatedLoadingTasks:
+        [NativeTimelineMediaKey: Task<Void, Never>] = [:]
     var animatedSubscribers:
-        [NativeTimelineMediaKey: [NativeMessageTimelineItem.Identifier: () -> Void]] = [:]
+        [NativeTimelineMediaKey: [AnimatedSubscriberID: () -> Void]] = [:]
     // Row bitmaps can outlive NSCache's volatile decoded-media entry. Keep
     // the exact source images used by each retained bitmap strongly reachable
     // so a hover/direct-paint pass cannot replace an already-visible
@@ -109,6 +397,43 @@ final class NativeTimelineMediaStore {
     var pinnedImages:
         [NativeTimelineMediaKey: PinnedImageReference] = [:]
     var pinnedImageCost = 0
+    private let decodedImageLoad: DecodedImageLoad
+    private let decodedImagePromotion: DecodedImagePromotion
+
+    init() {
+        decodedImageLoad = Self.loadDecodedImage
+        decodedImagePromotion = Self.promoteDecodedImageLoad
+    }
+
+    init(
+        decodedImageLoad: @escaping DecodedImageLoad,
+        decodedImagePromotion: @escaping DecodedImagePromotion = { _, _ in }
+    ) {
+        self.decodedImageLoad = decodedImageLoad
+        self.decodedImagePromotion = decodedImagePromotion
+    }
+
+    private nonisolated static func loadDecodedImage(
+        _ url: URL,
+        _ dimension: Int,
+        _ priority: MediaLoadPriority
+    ) async -> CGImage? {
+        await SharedDecodedImageLoader.shared.image(
+            for: url,
+            maximumPixelDimension: dimension,
+            priority: priority
+        )
+    }
+
+    private nonisolated static func promoteDecodedImageLoad(
+        _ url: URL,
+        _ dimension: Int
+    ) async {
+        await SharedDecodedImageLoader.shared.promoteImageLoad(
+            for: url,
+            maximumPixelDimension: dimension
+        )
+    }
 
     func image(for key: NativeTimelineMediaKey) -> NSImage? {
         if let pinned = pinnedImages[key] {
@@ -142,26 +467,44 @@ final class NativeTimelineMediaStore {
 
     func requestAnimated(
         _ key: NativeTimelineMediaKey,
+        owner: UUID,
         subscriber: NativeMessageTimelineItem.Identifier,
         completion: @escaping () -> Void
     ) {
         guard animatedCache.object(forKey: key.cacheKey) == nil else {
             return
         }
-        animatedSubscribers[key, default: [:]][subscriber] = completion
+        let subscriberID = AnimatedSubscriberID(
+            owner: owner,
+            row: subscriber
+        )
+        animatedSubscribers[key, default: [:]][subscriberID] = completion
         guard animatedLoading.insert(key).inserted else { return }
 
-        Task { [weak self] in
+        let loadID = UUID()
+        animatedLoadingTaskIDs[key] = loadID
+        let task = Task { [weak self] in
             let decoded: DecodedAnimatedImage?
-            do {
-                decoded = try await SharedAnimatedImageLoader.shared.image(
-                    for: key.url,
-                    maximumPixelDimension: key.maximumPixelDimension
-                )
-            } catch {
-                decoded = nil
+            var loaded: DecodedAnimatedImage?
+            for url in key.loadURLs where loaded == nil {
+                guard !Task.isCancelled else { break }
+                do {
+                    loaded = try await SharedAnimatedImageLoader.shared.image(
+                        for: url,
+                        maximumPixelDimension: key.maximumPixelDimension
+                    )
+                } catch is CancellationError {
+                    break
+                } catch {
+                    continue
+                }
             }
+            decoded = loaded
+            guard !Task.isCancelled else { return }
             guard let self else { return }
+            guard animatedLoadingTaskIDs[key] == loadID else { return }
+            animatedLoadingTaskIDs[key] = nil
+            animatedLoadingTasks[key] = nil
             animatedLoading.remove(key)
             let completions =
                 animatedSubscribers.removeValue(forKey: key)?.values
@@ -178,59 +521,136 @@ final class NativeTimelineMediaStore {
                 completion()
             }
         }
+        animatedLoadingTasks[key] = task
+    }
+
+    func cancelAnimatedRequests(owner: UUID) {
+        for key in Array(animatedSubscribers.keys) {
+            guard var subscriptions = animatedSubscribers[key] else {
+                continue
+            }
+            subscriptions = subscriptions.filter { subscriber, _ in
+                subscriber.owner != owner
+            }
+            if subscriptions.isEmpty {
+                animatedSubscribers[key] = nil
+                animatedLoadingTasks.removeValue(forKey: key)?.cancel()
+                animatedLoadingTaskIDs[key] = nil
+                animatedLoading.remove(key)
+            } else {
+                animatedSubscribers[key] = subscriptions
+            }
+        }
     }
 
     func request(
         _ key: NativeTimelineMediaKey,
+        owner: UUID,
         subscriber: NativeMessageTimelineItem.Identifier,
         priority: MediaLoadPriority = .visible,
-        completion: @escaping () -> Void
+        completion: @escaping (NativeTimelineStaticMediaLoadOutcome) -> Void
     ) {
         guard image(for: key) == nil else { return }
-        subscribers[key, default: [:]][subscriber] = completion
+        let subscriberID = StaticSubscriberID(owner: owner, row: subscriber)
+        subscribers[key, default: [:]][subscriberID] = completion
         guard loading.insert(key).inserted else {
-            if priority == .visible {
-                Task {
-                    await SharedMediaDataLoader.shared.promotePendingLoad(
-                        for: key.url
+            guard priority == .visible,
+                  loadingPriorities[key] == .prefetch,
+                  let loadID = loadingTaskIDs[key]
+            else { return }
+            loadingPriorities[key] = .visible
+            let decodedImagePromotion = decodedImagePromotion
+            Task { [weak self] in
+                for url in key.loadURLs {
+                    guard self?.loadingTaskIDs[key] == loadID else { return }
+                    await decodedImagePromotion(
+                        url,
+                        key.maximumPixelDimension
                     )
                 }
             }
             return
         }
 
-        Task { [weak self] in
+        let loadID = UUID()
+        loadingPriorities[key] = priority
+        loadingTaskIDs[key] = loadID
+        let task = Task { [weak self] in
+            guard let decodedImageLoad = self?.decodedImageLoad else { return }
             let image: NSImage?
-            do {
-                let data = try await SharedMediaDataLoader.shared.data(
-                    for: key.url,
-                    priority: priority
+            var decoded: CGImage?
+            for url in key.loadURLs where decoded == nil {
+                guard !Task.isCancelled else { break }
+                let effectivePriority = self?.loadingPriorities[key] ?? priority
+                decoded = await decodedImageLoad(
+                    url,
+                    key.maximumPixelDimension,
+                    effectivePriority
                 )
-                let decodePriority: TaskPriority =
-                    priority == .visible ? .userInitiated : .utility
-                let decoded = await Task.detached(priority: decodePriority) {
-                    NativeTimelineMediaDecoder.decode(
-                        data,
-                        maximumPixelDimension: key.maximumPixelDimension
-                    )
-                }.value
-                image = decoded.map {
-                    NSImage(
-                        cgImage: $0,
-                        size: NSSize(width: $0.width, height: $0.height)
-                    )
-                }
-            } catch {
-                image = nil
+            }
+            guard !Task.isCancelled else { return }
+            image = decoded.map {
+                NSImage(
+                    cgImage: $0,
+                    size: NSSize(width: $0.width, height: $0.height)
+                )
             }
             guard let self else { return }
+            guard loadingTaskIDs[key] == loadID else { return }
+            loadingTaskIDs[key] = nil
+            loadingTasks[key] = nil
             loading.remove(key)
+            loadingPriorities[key] = nil
             let completions = subscribers.removeValue(forKey: key)?.values ?? [:].values
             if let image {
                 cacheImage(image, for: key)
             }
             for completion in completions {
-                completion()
+                completion(image == nil ? .failed : .ready)
+            }
+        }
+        loadingTasks[key] = task
+    }
+
+    func cancelStaticRequestsOutsideVisibleSet(owner: UUID) {
+        let visibleKeys = visibleKeysByOwner[owner] ?? []
+        removeStaticSubscriptions(
+            owner: owner,
+            where: { !visibleKeys.contains($0) },
+            outcome: .cancelled
+        )
+    }
+
+    /// Canvas teardown already closes its owned signpost explicitly. Remove
+    /// its callbacks silently so another canvas sharing the same media key can
+    /// keep the coalesced load and receive its own completion.
+    func removeStaticRequests(owner: UUID) {
+        removeStaticSubscriptions(owner: owner, where: { _ in true })
+    }
+
+    private func removeStaticSubscriptions(
+        owner: UUID,
+        where shouldRemove: (NativeTimelineMediaKey) -> Bool,
+        outcome: NativeTimelineStaticMediaLoadOutcome? = nil
+    ) {
+        for key in Array(subscribers.keys) where shouldRemove(key) {
+            guard var subscriptions = subscribers[key] else { continue }
+            let removed = subscriptions.filter { $0.key.owner == owner }
+            guard !removed.isEmpty else { continue }
+            subscriptions = subscriptions.filter { $0.key.owner != owner }
+            if subscriptions.isEmpty {
+                subscribers[key] = nil
+                loadingTasks.removeValue(forKey: key)?.cancel()
+                loadingTaskIDs[key] = nil
+                loading.remove(key)
+                loadingPriorities[key] = nil
+            } else {
+                subscribers[key] = subscriptions
+            }
+            if let outcome {
+                for completion in removed.values {
+                    completion(outcome)
+                }
             }
         }
     }
@@ -391,6 +811,177 @@ final class NativeTimelineMediaStore {
 #endif
 }
 
+actor NativeTimelineMediaDecodeScheduler {
+    typealias DecodeOperation = @Sendable (Data, Int) -> CGImage?
+
+    static let shared = NativeTimelineMediaDecodeScheduler()
+    static let maximumConcurrentDecodes = 2
+    static let maximumConcurrentPrefetchDecodes = 1
+
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<MediaLoadPriority?, Never>
+    }
+
+    private var activeCount = 0
+    private var activePrefetchCount = 0
+    private var visibleWaiters: [Waiter] = []
+    private var prefetchWaiters: [Waiter] = []
+    private let decodeOperation: DecodeOperation
+
+    init(
+        decodeOperation: @escaping DecodeOperation = { data, maximumPixelDimension in
+            NativeTimelineMediaDecoder.decode(
+                data,
+                maximumPixelDimension: maximumPixelDimension
+            )
+        }
+    ) {
+        self.decodeOperation = decodeOperation
+    }
+
+    func decode(
+        _ data: Data,
+        maximumPixelDimension: Int,
+        priority: MediaLoadPriority,
+        waiterID: UUID = UUID()
+    ) async -> CGImage? {
+        let acquiredPriority = await withTaskCancellationHandler {
+            await acquire(waiterID: waiterID, priority: priority)
+        } onCancel: {
+            Task { await self.cancelWaiter(waiterID) }
+        }
+        guard let acquiredPriority, !Task.isCancelled else {
+            if let acquiredPriority {
+                release(priority: acquiredPriority)
+            }
+            return nil
+        }
+
+        let taskPriority: TaskPriority =
+            acquiredPriority == .visible ? .userInitiated : .utility
+        let worker: Task<CGImage?, Never> = Task.detached(
+            priority: taskPriority
+        ) { [decodeOperation] in
+            guard !Task.isCancelled else { return nil }
+            let image = decodeOperation(data, maximumPixelDimension)
+            return Task.isCancelled ? nil : image
+        }
+        let image = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        release(priority: acquiredPriority)
+        return Task.isCancelled ? nil : image
+    }
+
+    func promoteWaiter(_ id: UUID) {
+        guard let index = prefetchWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let waiter = prefetchWaiters.remove(at: index)
+        if activeCount < Self.maximumConcurrentDecodes {
+            activeCount += 1
+            waiter.continuation.resume(returning: .visible)
+        } else {
+            visibleWaiters.append(waiter)
+        }
+    }
+
+    private func acquire(
+        waiterID: UUID,
+        priority: MediaLoadPriority
+    ) async -> MediaLoadPriority? {
+        guard !Task.isCancelled else { return nil }
+        if activeCount < Self.maximumConcurrentDecodes,
+           priority == .visible
+            || activePrefetchCount < Self.maximumConcurrentPrefetchDecodes
+        {
+            activeCount += 1
+            if priority == .prefetch {
+                activePrefetchCount += 1
+            }
+            return priority
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let waiter = Waiter(
+                    id: waiterID,
+                    continuation: continuation
+                )
+                switch priority {
+                case .visible:
+                    visibleWaiters.append(waiter)
+                case .prefetch:
+                    prefetchWaiters.append(waiter)
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(waiterID) }
+        }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        if let index = visibleWaiters.firstIndex(where: { $0.id == id }) {
+            visibleWaiters.remove(at: index).continuation.resume(returning: nil)
+            return
+        }
+        if let index = prefetchWaiters.firstIndex(where: { $0.id == id }) {
+            prefetchWaiters.remove(at: index).continuation.resume(returning: nil)
+        }
+    }
+
+    private func release(priority: MediaLoadPriority) {
+        activeCount = max(0, activeCount - 1)
+        if priority == .prefetch {
+            activePrefetchCount = max(0, activePrefetchCount - 1)
+        }
+        if !visibleWaiters.isEmpty {
+            activeCount += 1
+            visibleWaiters.removeFirst().continuation.resume(returning: .visible)
+        } else if !prefetchWaiters.isEmpty,
+                  activePrefetchCount < Self.maximumConcurrentPrefetchDecodes
+        {
+            activeCount += 1
+            activePrefetchCount += 1
+            prefetchWaiters.removeFirst().continuation.resume(returning: .prefetch)
+        }
+    }
+
+#if DEBUG
+    struct Snapshot: Equatable, Sendable {
+        let activeCount: Int
+        let visibleWaiterCount: Int
+        let prefetchWaiterCount: Int
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            activeCount: activeCount,
+            visibleWaiterCount: visibleWaiters.count,
+            prefetchWaiterCount: prefetchWaiters.count
+        )
+    }
+
+    func acquirePermitForTesting(
+        priority: MediaLoadPriority
+    ) async -> Bool {
+        await acquire(waiterID: UUID(), priority: priority) != nil
+    }
+
+    func releasePermitForTesting(priority: MediaLoadPriority) {
+        release(priority: priority)
+    }
+#endif
+}
+
+enum NativeTimelineStaticMediaLoadOutcome: Equatable {
+    case ready
+    case failed
+    case cancelled
+}
+
 enum NativeTimelineMediaDecoder {
     nonisolated static func decode(
         _ data: Data,
@@ -399,6 +990,7 @@ enum NativeTimelineMediaDecoder {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             return nil
         }
+        guard !Task.isCancelled else { return nil }
         let options = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -774,8 +1366,19 @@ final class NativeTimelineActionCapsuleState: ObservableObject {
     @Published var isReactionPickerPresented = false {
         didSet {
             guard oldValue != isReactionPickerPresented else { return }
-            presentationDidChange?(isReactionPickerPresented)
+            presentationDidChange?(isPresentationActive)
         }
+    }
+
+    @Published var isDeleteConfirmationPresented = false {
+        didSet {
+            guard oldValue != isDeleteConfirmationPresented else { return }
+            presentationDidChange?(isPresentationActive)
+        }
+    }
+
+    var isPresentationActive: Bool {
+        isReactionPickerPresented || isDeleteConfirmationPresented
     }
 
     var presentationDidChange: ((Bool) -> Void)?
@@ -789,6 +1392,7 @@ struct NativeTimelineActionCapsuleOverlay: View {
     let retry: (() -> Void)?
     let edit: () -> Void
     let reply: (() -> Void)?
+    let forward: (() -> Void)?
     let react: (String) -> Void
     let copy: () -> Void
     let copyLink: () -> Void
@@ -801,9 +1405,12 @@ struct NativeTimelineActionCapsuleOverlay: View {
             message: message,
             canEdit: canEdit,
             isReactionPickerPresented: $state.isReactionPickerPresented,
+            isDeleteConfirmationPresented:
+                $state.isDeleteConfirmationPresented,
             retry: retry,
             edit: edit,
             reply: reply,
+            forward: forward,
             react: react,
             copy: copy,
             copyLink: copyLink,
@@ -818,19 +1425,117 @@ struct NativeTimelineMediaViewerPresentation: Identifiable {
     let id = UUID()
     let items: [RichMediaItem]
     let selection: Int
+    let authorName: String
+    let authorAvatarURL: URL?
+    let timestamp: Date
 }
 
 enum NativeTimelineMediaViewerPlan {
     static func attachments(
         in message: Message,
-        selectedAttachmentID: String
+        selectedAttachmentID: String,
+        isRevealed: (String) -> Bool = { _ in true }
     ) -> NativeTimelineMediaViewerPresentation? {
-        guard let selection = message.attachments.firstIndex(where: {
-            $0.id == selectedAttachmentID
-        }) else { return nil }
-        return NativeTimelineMediaViewerPresentation(
-            items: message.attachments.map(RichMediaItem.init),
-            selection: selection
+        let items = message.attachments.filter { attachment in
+            !attachment.isSpoiler
+                || isRevealed(
+                    NativeTimelineComponentRevealKey
+                        .attachmentComponentID(attachment.id)
+                )
+        }.map(RichMediaItem.init)
+        return presentation(
+            items: items,
+            selectedID: selectedAttachmentID,
+            message: message
+        )
+    }
+
+    static func linkedImages(
+        in message: Message,
+        selectedReferenceID: String
+    ) -> NativeTimelineMediaViewerPresentation? {
+        let items = LinkedImagePresentation(content: message.content)
+            .images.map { reference in
+                RichMediaItem(
+                    imageID: reference.id,
+                    url: reference.url,
+                    previewURL: reference.displayURL == reference.url
+                        ? nil
+                        : reference.displayURL,
+                    title: reference.label
+                )
+            }
+        return presentation(
+            items: items,
+            selectedID: selectedReferenceID,
+            message: message
+        )
+    }
+
+    static func components(
+        in message: Message,
+        layouts: [NativeTimelineComponentLayout],
+        selectedComponentID: String,
+        isRevealed: (String) -> Bool
+    ) -> NativeTimelineMediaViewerPresentation? {
+        let items = layouts.flatMap { layout -> [RichMediaItem] in
+            let hiddenContainers = layout.containers.filter {
+                $0.isSpoiler && !isRevealed($0.componentID)
+            }
+            func isVisible(_ frame: CGRect, isSpoiler: Bool, id: String) -> Bool {
+                (!isSpoiler || isRevealed(id))
+                    && !hiddenContainers.contains(where: {
+                        $0.frame.contains(frame)
+                    })
+            }
+
+            let images: [RichMediaItem] = layout.images.compactMap { region in
+                guard isVisible(
+                    region.frame,
+                    isSpoiler: region.isSpoiler,
+                    id: region.componentID
+                ) else { return nil }
+                return componentItem(
+                    id: region.componentID,
+                    url: region.openURL,
+                    previewURL: region.displayURL,
+                    title: region.description,
+                    isVideo: false,
+                    message: message
+                )
+            }
+            let media: [RichMediaItem] = layout.media.compactMap { region in
+                guard isVisible(
+                    region.frame,
+                    isSpoiler: region.isSpoiler,
+                    id: region.componentID
+                ) else { return nil }
+                return componentItem(
+                    id: region.componentID,
+                    url: region.openURL,
+                    previewURL: region.displayURL,
+                    title: region.description,
+                    isVideo: region.isVideo,
+                    message: message
+                )
+            }
+            let files: [RichMediaItem] = layout.files.compactMap { region in
+                guard isVisible(
+                    region.frame,
+                    isSpoiler: region.isSpoiler,
+                    id: region.componentID
+                ) else { return nil }
+                return componentImageFileItem(
+                    region,
+                    message: message
+                )
+            }
+            return images + media + files
+        }
+        return presentation(
+            items: items,
+            selectedID: selectedComponentID,
+            message: message
         )
     }
 
@@ -844,39 +1549,81 @@ enum NativeTimelineMediaViewerPlan {
                   attachments: message.attachments
               )
         else { return nil }
-        return NativeTimelineMediaViewerPresentation(
+        return presentation(
             items: [item],
-            selection: 0
+            selectedID: item.id,
+            message: message
         )
     }
-}
 
-@MainActor
-final class NativeTimelineMediaViewerState: ObservableObject {
-    @Published var presentation: NativeTimelineMediaViewerPresentation?
-
-    func present(_ value: NativeTimelineMediaViewerPresentation) {
-        presentation = value
+    private static func presentation(
+        items: [RichMediaItem],
+        selectedID: String,
+        message: Message
+    ) -> NativeTimelineMediaViewerPresentation? {
+        guard let selection = items.firstIndex(where: {
+            $0.id == selectedID
+        }) else { return nil }
+        return NativeTimelineMediaViewerPresentation(
+            items: items,
+            selection: selection,
+            authorName: message.guildMember?.nickname
+                ?? message.author.displayName,
+            authorAvatarURL: message.guildMember?.avatarURL
+                ?? message.author.avatarURL,
+            timestamp: message.timestamp
+        )
     }
 
-    func dismiss() {
-        presentation = nil
+    private static func componentItem(
+        id: String,
+        url: URL,
+        previewURL: URL,
+        title: String,
+        isVideo: Bool,
+        message: Message
+    ) -> RichMediaItem {
+        if var item = message.attachments
+            .first(where: { $0.url == url })
+            .map(RichMediaItem.init)
+        {
+            item.id = id
+            item.title = title
+            item.previewURL = previewURL == url ? item.previewURL : previewURL
+            return item
+        }
+        return RichMediaItem(
+            componentID: id,
+            url: url,
+            previewURL: previewURL == url ? nil : previewURL,
+            title: title,
+            isVideo: isVideo
+        )
     }
-}
 
-struct NativeTimelineMediaViewerLayer: View {
-    @ObservedObject var state: NativeTimelineMediaViewerState
-
-    var body: some View {
-        Color.clear
-            .frame(width: 0, height: 0)
-            .sheet(item: $state.presentation) { presentation in
-                MediaViewer(
-                    items: presentation.items,
-                    selection: presentation.selection,
-                    close: state.dismiss
-                )
-            }
+    private static func componentImageFileItem(
+        _ region: NativeTimelineComponentLayout.FileRegion,
+        message: Message
+    ) -> RichMediaItem? {
+        if let attachment = message.attachments.first(where: {
+            $0.url == region.openURL
+        }) {
+            var item = RichMediaItem(attachment)
+            guard case .image = item.kind else { return nil }
+            item.id = region.componentID
+            item.title = region.title
+            item.description = region.description
+            return item
+        }
+        guard RichMediaItem.isSupportedImageURL(region.openURL) else {
+            return nil
+        }
+        return RichMediaItem(
+            imageID: region.componentID,
+            url: region.openURL,
+            title: region.title,
+            description: region.description
+        )
     }
 }
 

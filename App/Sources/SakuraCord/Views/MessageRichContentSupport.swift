@@ -464,6 +464,67 @@ struct RichMediaItem: Identifiable, Hashable {
         isSpoiler = media.isSpoiler
     }
 
+    init(
+        imageID: String,
+        url: URL,
+        previewURL: URL? = nil,
+        title: String,
+        description: String? = nil,
+        width: Int? = nil,
+        height: Int? = nil
+    ) {
+        id = imageID
+        self.url = url
+        self.previewURL = previewURL
+        self.title = title
+        self.description = description
+        self.width = width
+        self.height = height
+        size = 0
+        let pathExtension = url.pathExtension.lowercased()
+        kind = .image(
+            animated: pathExtension == "gif" || pathExtension == "apng"
+        )
+        isSpoiler = false
+        autoplaysInline = false
+    }
+
+    init(
+        componentID: String,
+        url: URL,
+        previewURL: URL? = nil,
+        title: String,
+        description: String? = nil,
+        isVideo: Bool
+    ) {
+        id = componentID
+        self.url = url
+        self.previewURL = previewURL
+        self.title = title
+        self.description = description
+        width = nil
+        height = nil
+        size = 0
+        kind = isVideo
+            ? .video
+            : .image(animated: Self.isAnimatedImageURL(url))
+        isSpoiler = false
+        autoplaysInline = false
+    }
+
+    static func isSupportedImageURL(_ url: URL) -> Bool {
+        let extensions = Set([
+            "apng", "avif", "gif", "heic", "heif", "jpeg", "jpg",
+            "png", "tiff", "webp",
+        ])
+        return extensions.contains(url.pathExtension.lowercased())
+    }
+
+    private static func isAnimatedImageURL(_ url: URL) -> Bool {
+        let pathExtension = url.pathExtension.lowercased()
+        return pathExtension == "gif" || pathExtension == "apng"
+    }
+
     var aspectRatio: CGFloat {
         guard let width, let height, width > 0, height > 0 else { return 16 / 9 }
         return CGFloat(width) / CGFloat(height)

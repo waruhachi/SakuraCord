@@ -88,12 +88,33 @@ nonisolated enum ChannelNotificationInheritanceSource: Equatable, Sendable {
     }
 }
 
+nonisolated enum ChannelContextMenuSubject: Equatable, Sendable {
+    case channel
+    case category
+
+    var muteTitle: String {
+        self == .category ? "Mute Category" : "Mute Channel"
+    }
+
+    var unmuteTitle: String {
+        self == .category ? "Unmute Category" : "Unmute Channel"
+    }
+
+    var copyIDTitle: String {
+        self == .category ? "Copy Category ID" : "Copy Channel ID"
+    }
+
+    var includesCopyLink: Bool { self == .channel }
+}
+
 /// SwiftUI context menus can discard item images in the macOS 27 adaptation.
 /// This bridge uses the same AppKit symbol configuration as message menus.
 struct ChannelContextMenuBridge: NSViewRepresentable {
+    var subject: ChannelContextMenuSubject = .channel
     let isSelected: Bool
     let isUnread: Bool
     let isMutationPending: Bool
+    var allowsMutations = true
     let directOverride: ChannelNotificationOverride?
     let inheritedLevel: MessageNotificationLevel
     let inheritanceSource: ChannelNotificationInheritanceSource
@@ -135,7 +156,9 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject {
         private var isUnread: Bool
+        private var subject: ChannelContextMenuSubject
         private var isMutationPending: Bool
+        private var allowsMutations: Bool
         private var directOverride: ChannelNotificationOverride?
         private var inheritedLevel: MessageNotificationLevel
         private var inheritanceSource: ChannelNotificationInheritanceSource
@@ -147,8 +170,10 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
         private var copyLink: () -> Void
 
         init(from bridge: ChannelContextMenuBridge) {
+            subject = bridge.subject
             isUnread = bridge.isUnread
             isMutationPending = bridge.isMutationPending
+            allowsMutations = bridge.allowsMutations
             directOverride = bridge.directOverride
             inheritedLevel = bridge.inheritedLevel
             inheritanceSource = bridge.inheritanceSource
@@ -161,8 +186,10 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
         }
 
         func update(from bridge: ChannelContextMenuBridge) {
+            subject = bridge.subject
             isUnread = bridge.isUnread
             isMutationPending = bridge.isMutationPending
+            allowsMutations = bridge.allowsMutations
             directOverride = bridge.directOverride
             inheritedLevel = bridge.inheritedLevel
             inheritanceSource = bridge.inheritanceSource
@@ -183,17 +210,17 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
                     "Mark as Read",
                     systemImage: "envelope.open.fill",
                     action: #selector(markReadFromMenu),
-                    isEnabled: isUnread
+                    isEnabled: isUnread && allowsMutations
                 )
             )
             menu.addItem(.separator())
 
             if isDirectlyMuted {
                 let unmuteItem = menuItem(
-                    "Unmute Channel",
+                    subject.unmuteTitle,
                     systemImage: "bell.fill",
                     action: #selector(unmuteFromMenu),
-                    isEnabled: !isMutationPending
+                    isEnabled: allowsMutations && !isMutationPending
                 )
                 if let subtitle = ChannelContextMenuSubtitle.muteRemaining(
                     until: directOverride?.muteConfiguration?.endTime
@@ -203,18 +230,18 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
                 menu.addItem(unmuteItem)
             } else {
                 let muteItem = menuItem(
-                    "Mute Channel",
+                    subject.muteTitle,
                     systemImage: "bell.slash.fill",
                     action: nil,
-                    isEnabled: !isMutationPending
+                    isEnabled: allowsMutations && !isMutationPending
                 )
-                let muteMenu = NSMenu(title: "Mute Channel")
+                let muteMenu = NSMenu(title: subject.muteTitle)
                 muteMenu.autoenablesItems = false
                 for (index, duration) in ChannelMuteDuration.allCases.enumerated() {
                     let item = menuItem(
                         duration.title,
                         action: #selector(muteFromMenu(_:)),
-                        isEnabled: !isMutationPending
+                        isEnabled: allowsMutations && !isMutationPending
                     )
                     item.representedObject = NSNumber(value: index)
                     muteMenu.addItem(item)
@@ -227,7 +254,7 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
                 "Notification Settings",
                 systemImage: "bell.badge.fill",
                 action: nil,
-                isEnabled: !isMutationPending
+                isEnabled: allowsMutations && !isMutationPending
             )
             notificationItem.subtitle =
                 ChannelContextMenuSubtitle.notificationSelection(
@@ -241,18 +268,20 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
             menu.addItem(.separator())
             menu.addItem(
                 menuItem(
-                    "Copy Channel ID",
+                    subject.copyIDTitle,
                     systemImage: "number.square.fill",
                     action: #selector(copyChannelIDFromMenu)
                 )
             )
-            menu.addItem(
-                menuItem(
-                    "Copy Link",
-                    systemImage: "link",
-                    action: #selector(copyLinkFromMenu)
+            if subject.includesCopyLink {
+                menu.addItem(
+                    menuItem(
+                        "Copy Link",
+                        systemImage: "link",
+                        action: #selector(copyLinkFromMenu)
+                    )
                 )
-            )
+            }
             return menu
         }
 
@@ -278,7 +307,7 @@ struct ChannelContextMenuBridge: NSViewRepresentable {
                 let item = menuItem(
                     title,
                     action: #selector(setNotificationFromMenu(_:)),
-                    isEnabled: !isMutationPending
+                    isEnabled: allowsMutations && !isMutationPending
                 )
                 item.state = selected == level ? .on : .off
                 item.representedObject = NSNumber(value: level.rawValue)
@@ -468,59 +497,183 @@ final class ChannelContextMenuHitView: NSView {
     }
 
     private func synchronizeNativeHoverGeometry() {
-        guard let nativeRowView,
-              let selectionView = nativeSelectionView(near: nativeRowView)
-        else { return }
+        guard let nativeRowView else { return }
 
-        let selectionRow = selectionView.superview?.bounds ?? nativeRowView.bounds
-        let leadingInset = selectionView.frame.minX - selectionRow.minX
-        let trailingInset = selectionRow.maxX - selectionView.frame.maxX
-        nativeHoverView.frame = NSRect(
-            x: nativeRowView.bounds.minX + leadingInset,
-            y: nativeRowView.bounds.minY + selectionView.frame.minY,
-            width: max(
-                0,
-                nativeRowView.bounds.width - leadingInset - trailingInset
-            ),
-            height: selectionView.frame.height
-        )
-        nativeHoverView.material = selectionView.material
-        nativeHoverView.blendingMode = selectionView.blendingMode
-        nativeHoverView.state = selectionView.state
-        nativeHoverView.layer?.cornerRadius =
-            selectionView.layer?.cornerRadius ?? 0
-        nativeHoverView.layer?.cornerCurve =
-            selectionView.layer?.cornerCurve ?? .circular
-        nativeHoverView.layer?.maskedCorners =
-            selectionView.layer?.maskedCorners ?? []
+        let template: ChannelNativeHoverTemplate
+        if let tableView = enclosingNativeTableView(near: nativeRowView) {
+            if let selectionView = nativeSelectionView(in: tableView) {
+                template = ChannelNativeHoverTemplate(
+                    selectionView: selectionView,
+                    fallbackRowBounds: nativeRowView.bounds
+                )
+                ChannelNativeHoverTemplateStore.shared.set(
+                    template,
+                    for: tableView
+                )
+            } else {
+                template =
+                    ChannelNativeHoverTemplateStore.shared.template(for: tableView)
+                    ?? .fallback
+            }
+        } else {
+            template = .fallback
+        }
+
+        template.apply(to: nativeHoverView, in: nativeRowView.bounds)
     }
 
-    private func nativeSelectionView(
+    private func enclosingNativeTableView(
         near rowView: NSTableRowView
-    ) -> NSVisualEffectView? {
+    ) -> NSTableView? {
         var candidate = rowView.superview
         while let view = candidate {
             if let tableView = view as? NSTableView {
-                for row in tableView.rows(in: tableView.visibleRect).integerRange {
-                    guard let visibleRow = tableView.rowView(
-                        atRow: row,
-                        makeIfNecessary: false
-                    ) else { continue }
-                    if let selectionView = visibleRow.subviews
-                        .compactMap({ $0 as? NSVisualEffectView })
-                        .first(where: {
-                            !($0 is ChannelNativeHoverRowView)
-                                && $0.material == .selection
-                        })
-                    {
-                        return selectionView
-                    }
-                }
-                return nil
+                return tableView
             }
             candidate = view.superview
         }
         return nil
+    }
+
+    private func nativeSelectionView(
+        in tableView: NSTableView
+    ) -> NSVisualEffectView? {
+        for row in tableView.rows(in: tableView.visibleRect).integerRange {
+            guard let visibleRow = tableView.rowView(
+                atRow: row,
+                makeIfNecessary: false
+            ) else { continue }
+            if let selectionView = visibleRow.subviews
+                .compactMap({ $0 as? NSVisualEffectView })
+                .first(where: {
+                    !($0 is ChannelNativeHoverRowView)
+                        && $0.material == .selection
+                })
+            {
+                return selectionView
+            }
+        }
+        return nil
+    }
+}
+
+@MainActor
+struct ChannelNativeHoverTemplate {
+    static let fallback = ChannelNativeHoverTemplate(
+        leadingInset: 5,
+        trailingInset: 5,
+        verticalInset: 2,
+        height: nil,
+        material: .selection,
+        blendingMode: .withinWindow,
+        state: .followsWindowActiveState,
+        cornerRadius: 6,
+        cornerCurve: .continuous,
+        maskedCorners: [.layerMinXMinYCorner, .layerMaxXMinYCorner,
+                        .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+    )
+
+    let leadingInset: CGFloat
+    let trailingInset: CGFloat
+    let verticalInset: CGFloat
+    let height: CGFloat?
+    let material: NSVisualEffectView.Material
+    let blendingMode: NSVisualEffectView.BlendingMode
+    let state: NSVisualEffectView.State
+    let cornerRadius: CGFloat
+    let cornerCurve: CALayerCornerCurve
+    let maskedCorners: CACornerMask
+
+    init(
+        selectionView: NSVisualEffectView,
+        fallbackRowBounds: NSRect
+    ) {
+        let selectionRow = selectionView.superview?.bounds ?? fallbackRowBounds
+        leadingInset = selectionView.frame.minX - selectionRow.minX
+        trailingInset = selectionRow.maxX - selectionView.frame.maxX
+        verticalInset = selectionView.frame.minY - selectionRow.minY
+        height = selectionView.frame.height
+        material = selectionView.material
+        blendingMode = selectionView.blendingMode
+        state = selectionView.state
+        cornerRadius = selectionView.layer?.cornerRadius ?? 0
+        cornerCurve = selectionView.layer?.cornerCurve ?? .circular
+        maskedCorners = selectionView.layer?.maskedCorners ?? []
+    }
+
+    init(
+        leadingInset: CGFloat,
+        trailingInset: CGFloat,
+        verticalInset: CGFloat,
+        height: CGFloat?,
+        material: NSVisualEffectView.Material,
+        blendingMode: NSVisualEffectView.BlendingMode,
+        state: NSVisualEffectView.State,
+        cornerRadius: CGFloat,
+        cornerCurve: CALayerCornerCurve,
+        maskedCorners: CACornerMask
+    ) {
+        self.leadingInset = leadingInset
+        self.trailingInset = trailingInset
+        self.verticalInset = verticalInset
+        self.height = height
+        self.material = material
+        self.blendingMode = blendingMode
+        self.state = state
+        self.cornerRadius = cornerRadius
+        self.cornerCurve = cornerCurve
+        self.maskedCorners = maskedCorners
+    }
+
+    func frame(in rowBounds: NSRect) -> NSRect {
+        NSRect(
+            x: rowBounds.minX + leadingInset,
+            y: rowBounds.minY + verticalInset,
+            width: max(0, rowBounds.width - leadingInset - trailingInset),
+            height: height ?? max(0, rowBounds.height - 2 * verticalInset)
+        )
+    }
+
+    func apply(
+        to hoverView: NSVisualEffectView,
+        in rowBounds: NSRect
+    ) {
+        hoverView.frame = frame(in: rowBounds)
+        hoverView.material = material
+        hoverView.blendingMode = blendingMode
+        hoverView.state = state
+        hoverView.layer?.cornerRadius = cornerRadius
+        hoverView.layer?.cornerCurve = cornerCurve
+        hoverView.layer?.maskedCorners = maskedCorners
+    }
+}
+
+@MainActor
+final class ChannelNativeHoverTemplateStore {
+    static let shared = ChannelNativeHoverTemplateStore()
+
+    private final class Box: NSObject {
+        let template: ChannelNativeHoverTemplate
+
+        init(_ template: ChannelNativeHoverTemplate) {
+            self.template = template
+        }
+    }
+
+    private let templates = NSMapTable<NSTableView, Box>(
+        keyOptions: .weakMemory,
+        valueOptions: .strongMemory
+    )
+
+    func template(for tableView: NSTableView) -> ChannelNativeHoverTemplate? {
+        templates.object(forKey: tableView)?.template
+    }
+
+    func set(
+        _ template: ChannelNativeHoverTemplate,
+        for tableView: NSTableView
+    ) {
+        templates.setObject(Box(template), forKey: tableView)
     }
 }
 

@@ -175,6 +175,10 @@ struct CustomEmojiRichText: View {
     var model: AppModel?
     let content: String
     let emojiSize: CGFloat
+    var baseFontSize: CGFloat?
+    var maximumNumberOfLines: Int?
+    var isSelectable = true
+    var foregroundColor: NSColor?
     let mentionPresentation: (RenderedMention) -> MentionPresentation
     let onMentionClick: (MentionPresentation, StablePopoverAnchor) -> Void
     let onURLClick: (URL) -> Bool
@@ -184,6 +188,10 @@ struct CustomEmojiRichText: View {
         model: AppModel? = nil,
         content: String,
         emojiSize: CGFloat,
+        baseFontSize: CGFloat? = nil,
+        maximumNumberOfLines: Int? = nil,
+        isSelectable: Bool = true,
+        foregroundColor: NSColor? = nil,
         mentionPresentation: @escaping (RenderedMention) -> MentionPresentation = {
             MentionPresentation.fallback(for: $0)
         },
@@ -193,6 +201,10 @@ struct CustomEmojiRichText: View {
         self.model = model
         self.content = content
         self.emojiSize = emojiSize
+        self.baseFontSize = baseFontSize
+        self.maximumNumberOfLines = maximumNumberOfLines
+        self.isSelectable = isSelectable
+        self.foregroundColor = foregroundColor
         self.mentionPresentation = mentionPresentation
         self.onMentionClick = onMentionClick
         self.onURLClick = onURLClick
@@ -203,6 +215,10 @@ struct CustomEmojiRichText: View {
             model: model,
             source: content,
             emojiSize: emojiSize,
+            baseFontSize: baseFontSize,
+            maximumNumberOfLines: maximumNumberOfLines,
+            isSelectable: isSelectable,
+            foregroundColor: foregroundColor,
             mentionPresentations: mentionPresentations,
             onMentionClick: handleMentionClick,
             onURLClick: onURLClick
@@ -247,16 +263,18 @@ struct CustomEmojiRichText: View {
                 ?? model.threadMessages.first { $0.author.id == id }?.author
                 ?? (model.snapshot?.currentUser.id == id ? model.snapshot?.currentUser : nil)
             guard let user else { return }
-            model.showProfile(for: user)
+            let requestID = model.showProfile(for: user)
             presentedMention = AnchoredMentionPresentation(
                 mention: mention,
-                anchor: anchor
+                anchor: anchor,
+                profileRequestID: requestID
             )
         case let .role(id):
             model.showMembers(withRole: id)
             presentedMention = AnchoredMentionPresentation(
                 mention: mention,
-                anchor: anchor
+                anchor: anchor,
+                profileRequestID: nil
             )
         case let .channel(id):
             model.navigate(to: id)
@@ -272,6 +290,7 @@ struct AnchoredMentionPresentation: Identifiable {
     let id = UUID()
     let mention: MentionPresentation
     let anchor: StablePopoverAnchor
+    let profileRequestID: UUID?
 }
 
 private struct AnchoredMentionPopoverLayer: View {
@@ -289,7 +308,13 @@ private struct AnchoredMentionPopoverLayer: View {
             ) {
                 switch request.mention.target {
                 case let .user(id):
-                    MessageProfilePopoverContent(model: model, userID: id)
+                    if let requestID = request.profileRequestID {
+                        MessageProfilePopoverContent(
+                            model: model,
+                            userID: id,
+                            requestID: requestID
+                        )
+                    }
                 case let .role(id):
                     RoleMembersPopover(model: model, roleID: id)
                 case .unresolved, .channel, .linkedChannel, .message:

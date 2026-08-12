@@ -2,6 +2,22 @@ import Foundation
 import SakuraCordModels
 
 extension DiscordRESTProvider {
+    #if DEBUG
+        func orderedMemberListIDsForTesting(
+            guildID: GuildID, memberListID: String
+        ) -> [UserID] {
+            orderedMemberListMembers(
+                guildID: guildID, memberListID: memberListID
+            )?.map(\.id) ?? []
+        }
+
+        func memberListGroupsForTesting(
+            guildID: GuildID, memberListID: String
+        ) -> [GuildMemberListGroup] {
+            cachedMemberListGroups[guildID]?[memberListID] ?? []
+        }
+    #endif
+
     func finishVoiceNegotiationIfReady() {
         guard let pending = pendingVoiceNegotiation,
               let sessionID = pending.sessionID,
@@ -30,11 +46,11 @@ extension DiscordRESTProvider {
         pending.continuation.resume(throwing: error)
     }
 
-    func decodedMemberListMembers(guildID: GuildID) -> [Member] {
+    func decodedMemberListMembers(guildID: GuildID, memberListID: String) -> [Member] {
         var seen = Set<UserID>()
-        return (cachedMemberListItems[guildID] ?? []).compactMap { item -> Member? in
+        return (cachedMemberListItems[guildID]?[memberListID] ?? []).enumerated().compactMap { index, item -> Member? in
             guard let memberDTO = item?.member,
-                  let member = try? memberDTO.domain(
+                  var member = try? memberDTO.domain(
                       currentUserID: currentUser?.id,
                       currentStatus: presenceStatus,
                       presence: item?.presence,
@@ -43,18 +59,25 @@ extension DiscordRESTProvider {
                   ),
                   seen.insert(member.id).inserted
             else { return nil }
+            member.memberListIndex = index
             return member
         }
     }
 
-    func orderedMemberListMembers(guildID: GuildID) -> [Member]? {
-        guard cachedMemberListItems[guildID] != nil else { return nil }
+    func orderedMemberListMembers(guildID: GuildID, memberListID: String? = nil) -> [Member]? {
+        guard let memberListID = memberListID ?? selectedMemberListID[guildID],
+              cachedMemberListItems[guildID]?[memberListID] != nil
+        else { return nil }
         let cachedByID = Dictionary(
             (cachedMembers[guildID] ?? []).map { ($0.id, $0) },
             uniquingKeysWith: { _, newer in newer }
         )
-        return decodedMemberListMembers(guildID: guildID).map {
-            cachedByID[$0.id] ?? $0
+        return decodedMemberListMembers(guildID: guildID, memberListID: memberListID).map { indexedMember in
+            guard var cached = cachedByID[indexedMember.id] else {
+                return indexedMember
+            }
+            cached.memberListIndex = indexedMember.memberListIndex
+            return cached
         }
     }
 
@@ -113,13 +136,20 @@ extension DiscordRESTProvider {
     }
 
     func applyMemberListOperations(
-        _ operations: [GuildMemberListUpdateDTO.Operation], guildID: GuildID
+        _ operations: [GuildMemberListUpdateDTO.Operation],
+        guildID: GuildID,
+        memberListID: String
     ) {
-        var items = cachedMemberListItems[guildID] ?? []
+        var items = cachedMemberListItems[guildID]?[memberListID] ?? []
         for operation in operations {
             Self.memberListOperationApplication(&items, operation)
         }
-        cachedMemberListItems[guildID] = items
+        cachedMemberListItems[guildID, default: [:]][memberListID] = items
+    }
+
+    func selectedMemberListGroups(guildID: GuildID) -> [GuildMemberListGroup] {
+        guard let memberListID = selectedMemberListID[guildID] else { return [] }
+        return cachedMemberListGroups[guildID]?[memberListID] ?? []
     }
 
     func request<Response: Decodable>(
@@ -197,7 +227,7 @@ extension DiscordRESTProvider {
 
             guard var components = URLComponents(
                 string:
-                "https://discord.com/api/v\(DiscordProductionBaseline.july2026.apiVersion)\(path)"
+                "https://discord.com/api/v\(DiscordProductionBaseline.august2026.apiVersion)\(path)"
             ) else {
                 throw ChatProviderError.invalidRequest("Could not construct the Discord API path.")
             }
@@ -220,7 +250,7 @@ extension DiscordRESTProvider {
                     "Discord networking is stopped for this session.")
             }
             request.setValue(token, forHTTPHeaderField: "Authorization")
-            try clientMetadata.apply(to: &request)
+            try clientMetadata.apply(to: &request, clientAppState: clientAppState)
             for (name, value) in headers {
                 request.setValue(value, forHTTPHeaderField: name)
             }
@@ -252,7 +282,17 @@ extension DiscordRESTProvider {
                 throw error
             }
             guard let response = rawResponse as? HTTPURLResponse else {
-                throw ChatProviderError.invalidRequest("Discord returned an invalid HTTP response.")
+                let error = ChatProviderError.invalidRequest(
+                    "Discord returned an invalid HTTP response."
+                )
+                apiDiagnostics.recordHTTPFailure(
+                    method: method,
+                    path: path,
+                    attempt: requestAttempt,
+                    duration: requestStarted.duration(to: .now),
+                    error: error
+                )
+                throw error
             }
             apiDiagnostics.recordHTTPResponse(
                 method: method,
@@ -314,12 +354,16 @@ extension DiscordRESTProvider {
                 )
             }
             if response.statusCode == 404 {
-                unexpectedNotFoundCounts[route, default: 0] += 1
-                if unexpectedNotFoundCounts[route, default: 0] >= 2 {
-                    await openSafetyCircuit(status: 404, discordCode: discordCode, route: route)
-                    throw ChatProviderError.invalidRequest(
-                        "Discord networking was stopped after this route repeatedly returned an unexpected not-found response."
-                    )
+                if Self.isExpectedResourceNotFound(method: method, path: path) {
+                    unexpectedNotFoundCounts[route] = nil
+                } else {
+                    unexpectedNotFoundCounts[route, default: 0] += 1
+                    if unexpectedNotFoundCounts[route, default: 0] >= 2 {
+                        await openSafetyCircuit(status: 404, discordCode: discordCode, route: route)
+                        throw ChatProviderError.invalidRequest(
+                            "Discord networking was stopped after this route repeatedly returned an unexpected not-found response."
+                        )
+                    }
                 }
             } else if (200 ..< 300).contains(response.statusCode) {
                 unexpectedNotFoundCounts[route] = nil
@@ -438,6 +482,15 @@ extension DiscordRESTProvider {
         status == 401 || discordCode == 40001 || discordCode == 50014
     }
 
+    static func isExpectedResourceNotFound(method: String, path: String) -> Bool {
+        guard method == "GET" else { return false }
+        let segments = path.split(separator: "/")
+        return segments.count == 3
+            && segments[0] == "users"
+            && UInt64(segments[1]) != nil
+            && segments[2] == "profile"
+    }
+
     static func safetyStopMessage(status: Int, discordCode: Int?) -> String {
         switch discordCode {
         case 10005:
@@ -465,10 +518,21 @@ extension DiscordRESTProvider {
     }
 
     func authorizationToken() async throws -> String {
+        guard !requestSafetyCircuitIsOpen else {
+            throw ChatProviderError.invalidRequest(
+                "Discord networking is stopped for this session."
+            )
+        }
         if let authorizationValue {
             return authorizationValue
         }
-        let credential = try await credentials.credential(for: handle)
+        var credential = try await credentialSource.credential()
+        defer { credential.resetBytes(in: credential.indices) }
+        guard !requestSafetyCircuitIsOpen else {
+            throw ChatProviderError.invalidRequest(
+                "Discord networking is stopped for this session."
+            )
+        }
         guard let value = String(data: credential, encoding: .utf8) else {
             throw ChatProviderError.unauthenticated
         }
@@ -496,5 +560,24 @@ extension DiscordRESTProvider {
             return false
         }
         return (object["global"] as? Bool) == true
+    }
+}
+
+enum DiscordCredentialSource: Sendable {
+    case stored(any CredentialStore, CredentialHandle)
+    case pending(PendingDiscordCredential)
+
+    var isPending: Bool {
+        if case .pending = self { return true }
+        return false
+    }
+
+    func credential() async throws -> Data {
+        switch self {
+        case let .stored(store, handle):
+            try await store.credential(for: handle)
+        case let .pending(pendingCredential):
+            try await pendingCredential.value()
+        }
     }
 }

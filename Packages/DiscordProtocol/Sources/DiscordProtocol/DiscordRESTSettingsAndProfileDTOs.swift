@@ -56,6 +56,8 @@ enum DiscordSettingsProto {
         var frequentEntries: [FrequentEmojiEntry] = []
         var scores: [String: Int] = [:]
         var guildAndChannelScores: [String: Int] = [:]
+        var guildAndChannelUsage: [String: DiscordFrecencyUsage] = [:]
+        var guildAndChannelUsageOrder: [String] = []
         while let tag = reader.readTag() {
             guard tag.wireType == 2, let payload = reader.readLengthDelimited() else {
                 if !reader.skip(wireType: tag.wireType) {
@@ -81,11 +83,16 @@ enum DiscordSettingsProto {
                     ))
                 }
             } else if tag.field == 12 {
-                for (key, score) in guildAndChannelFrecencyScores(
+                let decoded = guildAndChannelFrecency(
                     from: payload,
                     nowMilliseconds: nowMilliseconds
-                ) {
+                )
+                for (key, score) in decoded.scores {
                     guildAndChannelScores[key] = max(guildAndChannelScores[key, default: 0], score)
+                }
+                guildAndChannelUsage.merge(decoded.usage) { _, newer in newer }
+                for key in decoded.order where !guildAndChannelUsageOrder.contains(key) {
+                    guildAndChannelUsageOrder.append(key)
                 }
             }
         }
@@ -105,16 +112,263 @@ enum DiscordSettingsProto {
             favoriteKeys: favorites,
             frequentlyUsedKeys: Array(frequentlyUsed),
             usageScores: scores,
-            guildAndChannelUsageScores: guildAndChannelScores
+            guildAndChannelUsageScores: guildAndChannelScores,
+            guildAndChannelUsage: guildAndChannelUsage,
+            guildAndChannelUsageOrder: guildAndChannelUsageOrder
         )
     }
 
-    private static func guildAndChannelFrecencyScores(
+    static func gifFavorites(from data: Data) -> [GIFSearchResult] {
+        decodedGIFFavoriteContainer(from: data).favorites
+            .enumerated()
+            .sorted { left, right in
+                left.element.order == right.element.order
+                    ? left.offset < right.offset
+                    : left.element.order > right.element.order
+            }
+            .compactMap { $0.element.domain }
+    }
+
+    static func updatingGIFFavorite(
+        in data: Data,
+        gif: GIFSearchResult,
+        isFavorite: Bool
+    ) throws -> (data: Data, favorites: [GIFSearchResult]) {
+        var container = decodedGIFFavoriteContainer(from: data)
+        let key = gif.url.absoluteString
+        container.favorites.removeAll { $0.key == key }
+        if isFavorite {
+            let order = (container.favorites.map(\.order).max() ?? 0) + 1
+            let source = gif.previewURL ?? gif.mediaURL ?? gif.url
+            container.favorites.append(
+                StoredGIFFavorite(
+                    key: key,
+                    format: DiscordGIFFavoriteMediaPolicy.persistedFormat(
+                        for: source,
+                        declaredKind: source == gif.mediaURL
+                            ? gif.mediaKind
+                            : nil
+                    ),
+                    src: source.absoluteString,
+                    width: UInt64(clamping: max(0, gif.width ?? 0)),
+                    height: UInt64(clamping: max(0, gif.height ?? 0)),
+                    order: order
+                )
+            )
+            if container.favorites.count > 2 {
+                container.hideTooltip = true
+            }
+        }
+
+        let favoritePayload = encodedGIFFavoriteContainer(container)
+        guard favoritePayload.count <= 762_880 else {
+            throw ChatProviderError.invalidRequest(
+                "Discord's GIF favorites storage limit has been reached."
+            )
+        }
+        let updated = replacingLengthDelimitedField(
+            2,
+            in: data,
+            with: favoritePayload
+        )
+        return (updated, gifFavorites(from: updated))
+    }
+
+    private struct StoredGIFFavorite {
+        var key: String
+        var format: UInt64
+        var src: String
+        var width: UInt64
+        var height: UInt64
+        var order: UInt64
+
+        var domain: GIFSearchResult? {
+            guard let url = normalizedURL(key),
+                  let source = normalizedURL(src)
+            else { return nil }
+            let preview = DiscordGIFFavoriteMediaPolicy.previewURL(for: source)
+            let mediaKind: GIFMediaKind? = switch format {
+            case 1: .image
+            case 2: .video
+            default: nil
+            }
+            return GIFSearchResult(
+                id: key,
+                title: "Favorite GIF",
+                url: url,
+                previewURL: preview,
+                width: Int(clamping: width),
+                height: Int(clamping: height),
+                mediaURL: source,
+                mediaKind: mediaKind
+            )
+        }
+    }
+
+    private struct StoredGIFFavoriteContainer {
+        var favorites: [StoredGIFFavorite] = []
+        var hideTooltip = false
+    }
+
+    private static func decodedGIFFavoriteContainer(
+        from data: Data
+    ) -> StoredGIFFavoriteContainer {
+        var topLevel = ProtoReader(data: data)
+        while let field = topLevel.readRawField() {
+            guard field.field == 2, field.wireType == 2, let payload = field.payload else {
+                continue
+            }
+            return decodedGIFFavoriteContainerPayload(payload)
+        }
+        return StoredGIFFavoriteContainer()
+    }
+
+    private static func decodedGIFFavoriteContainerPayload(
+        _ data: Data
+    ) -> StoredGIFFavoriteContainer {
+        var container = StoredGIFFavoriteContainer()
+        var reader = ProtoReader(data: data)
+        while let field = reader.readRawField() {
+            if field.field == 1, field.wireType == 2, let payload = field.payload,
+               let favorite = decodedGIFFavoriteMapEntry(payload)
+            {
+                container.favorites.append(favorite)
+            } else if field.field == 2, field.wireType == 0 {
+                container.hideTooltip = field.varint != 0
+            }
+        }
+        return container
+    }
+
+    private static func decodedGIFFavoriteMapEntry(_ data: Data) -> StoredGIFFavorite? {
+        var reader = ProtoReader(data: data)
+        var key: String?
+        var favoriteData: Data?
+        while let field = reader.readRawField() {
+            if field.field == 1, field.wireType == 2, let payload = field.payload {
+                key = String(data: payload, encoding: .utf8)
+            } else if field.field == 2, field.wireType == 2 {
+                favoriteData = field.payload
+            }
+        }
+        guard let key, let favoriteData else { return nil }
+        var favorite = StoredGIFFavorite(
+            key: key,
+            format: 0,
+            src: "",
+            width: 0,
+            height: 0,
+            order: 0
+        )
+        var favoriteReader = ProtoReader(data: favoriteData)
+        while let field = favoriteReader.readRawField() {
+            switch (field.field, field.wireType) {
+            case (1, 0): favorite.format = field.varint ?? 0
+            case (2, 2):
+                favorite.src = field.payload.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            case (3, 0): favorite.width = field.varint ?? 0
+            case (4, 0): favorite.height = field.varint ?? 0
+            case (5, 0): favorite.order = field.varint ?? 0
+            default: break
+            }
+        }
+        return favorite.src.isEmpty ? nil : favorite
+    }
+
+    private static func encodedGIFFavoriteContainer(
+        _ container: StoredGIFFavoriteContainer
+    ) -> Data {
+        var data = Data()
+        for favorite in container.favorites {
+            var value = Data()
+            value.append(protoVarintField(1, favorite.format))
+            value.append(protoStringField(2, favorite.src))
+            value.append(protoVarintField(3, favorite.width))
+            value.append(protoVarintField(4, favorite.height))
+            value.append(protoVarintField(5, favorite.order))
+
+            var mapEntry = Data()
+            mapEntry.append(protoStringField(1, favorite.key))
+            mapEntry.append(protoLengthDelimitedField(2, value))
+            data.append(protoLengthDelimitedField(1, mapEntry))
+        }
+        if container.hideTooltip {
+            data.append(protoVarintField(2, 1))
+        }
+        return data
+    }
+
+    private static func replacingLengthDelimitedField(
+        _ fieldNumber: Int,
+        in data: Data,
+        with payload: Data
+    ) -> Data {
+        var reader = ProtoReader(data: data)
+        var result = Data()
+        var replaced = false
+        while let field = reader.readRawField() {
+            if field.field == fieldNumber, field.wireType == 2 {
+                if !replaced {
+                    result.append(protoLengthDelimitedField(fieldNumber, payload))
+                    replaced = true
+                }
+            } else {
+                result.append(field.raw)
+            }
+        }
+        if !replaced {
+            result.append(protoLengthDelimitedField(fieldNumber, payload))
+        }
+        return result
+    }
+
+    private static func protoStringField(_ field: Int, _ value: String) -> Data {
+        protoLengthDelimitedField(field, Data(value.utf8))
+    }
+
+    private static func protoLengthDelimitedField(_ field: Int, _ value: Data) -> Data {
+        var data = protoVarint(UInt64(field << 3 | 2))
+        data.append(protoVarint(UInt64(value.count)))
+        data.append(value)
+        return data
+    }
+
+    private static func protoVarintField(_ field: Int, _ value: UInt64) -> Data {
+        var data = protoVarint(UInt64(field << 3))
+        data.append(protoVarint(value))
+        return data
+    }
+
+    private static func protoVarint(_ value: UInt64) -> Data {
+        var value = value
+        var data = Data()
+        repeat {
+            var byte = UInt8(value & 0x7F)
+            value >>= 7
+            if value != 0 { byte |= 0x80 }
+            data.append(byte)
+        } while value != 0
+        return data
+    }
+
+    private static func normalizedURL(_ value: String) -> URL? {
+        URL(string: value.hasPrefix("//") ? "https:\(value)" : value)
+    }
+
+    private struct GuildAndChannelFrecencyResult {
+        var scores: [String: Int]
+        var usage: [String: DiscordFrecencyUsage]
+        var order: [String]
+    }
+
+    private static func guildAndChannelFrecency(
         from data: Data,
         nowMilliseconds: UInt64
-    ) -> [String: Int] {
+    ) -> GuildAndChannelFrecencyResult {
         var reader = ProtoReader(data: data)
-        var result: [String: Int] = [:]
+        var scores: [String: Int] = [:]
+        var usage: [String: DiscordFrecencyUsage] = [:]
+        var order: [String] = []
         while let tag = reader.readTag() {
             guard tag.field == 1, tag.wireType == 2,
                   let mapEntry = reader.readLengthDelimited()
@@ -135,26 +389,28 @@ enum DiscordSettingsProto {
                 }
             }
             if let key, let item,
-               let score = computedGuildAndChannelFrecency(
-                   from: item,
-                   nowMilliseconds: nowMilliseconds
-               )
+               let decoded = decodedGuildAndChannelUsage(from: item)
             {
-                result[String(key)] = score
+                let stringKey = String(key)
+                if usage[stringKey] == nil { order.append(stringKey) }
+                usage[stringKey] = decoded
+                if let score = computedGuildAndChannelFrecency(
+                    decoded,
+                    nowMilliseconds: nowMilliseconds
+                ) {
+                    scores[stringKey] = score
+                }
             }
         }
-        return result
+        return GuildAndChannelFrecencyResult(scores: scores, usage: usage, order: order)
     }
 
-    private static var guildAndChannelFrecencyComputation:
-        (Data, UInt64) -> Int?
-    {
-        { data, nowMilliseconds in
+    private static func decodedGuildAndChannelUsage(
+        from data: Data
+    ) -> DiscordFrecencyUsage? {
         var reader = ProtoReader(data: data)
         var totalUses = 0
         var recentUses: [UInt64] = []
-        var storedFrecency = 0
-        var storedScore = 0
         while let tag = reader.readTag() {
             if tag.field == 1, tag.wireType == 0, let value = reader.readVarint() {
                 totalUses = Int(clamping: value)
@@ -167,23 +423,24 @@ enum DiscordSettingsProto {
                 while let value = packedReader.readVarint() {
                     if value > 0 { recentUses.append(value) }
                 }
-            } else if tag.field == 3, tag.wireType == 0, let value = reader.readVarint() {
-                storedFrecency = Int(clamping: value)
-            } else if tag.field == 4, tag.wireType == 0, let value = reader.readVarint() {
-                storedScore = Int(clamping: value)
             } else if !reader.skip(wireType: tag.wireType) {
                 break
             }
         }
-        let sampledUses = recentUses.prefix(10)
-        guard !sampledUses.isEmpty else {
-            // Discord persists the computed fields as well as recent samples.
-            // Older positive entries can legitimately have no retained sample,
-            // but the current autocomplete still treats their stored frecency
-            // as positive. The channel scorer only needs that same sign.
-            let stored = max(totalUses, max(storedFrecency, storedScore))
-            return stored > 0 ? stored : nil
-        }
+        guard totalUses > 0 || !recentUses.isEmpty else { return nil }
+        return DiscordFrecencyUsage(totalUses: totalUses, recentUses: recentUses)
+    }
+
+    private static func computedGuildAndChannelFrecency(
+        _ usage: DiscordFrecencyUsage,
+        nowMilliseconds: UInt64
+    ) -> Int? {
+        let sampledUses = usage.recentUses.prefix(10)
+        // Discord's current FrecencyStore replaces the persisted frecency with
+        // -1 and resets score to zero before recomputing. Entries without a
+        // retained recent-use sample are therefore removed even when the proto
+        // still carries stale values in fields 3 and 4.
+        guard !sampledUses.isEmpty else { return nil }
         let millisecondsPerDay: UInt64 = 86_400_000
         let recencyScore = sampledUses.reduce(into: 0) { result, timestamp in
             let ageDays =
@@ -202,18 +459,10 @@ enum DiscordSettingsProto {
         }
         guard recencyScore > 0 else { return nil }
         let computed = ceil(
-            Double(totalUses) * Double(recencyScore) / Double(sampledUses.count)
+            Double(usage.totalUses) * Double(recencyScore) / Double(sampledUses.count)
         )
         let recomputed = computed >= Double(Int.max) ? Int.max : Int(computed)
-        return max(recomputed, max(storedFrecency, storedScore))
-        }
-    }
-
-    private static func computedGuildAndChannelFrecency(
-        from data: Data,
-        nowMilliseconds: UInt64
-    ) -> Int? {
-        guildAndChannelFrecencyComputation(data, nowMilliseconds)
+        return recomputed
     }
 
     private static func strings(fromRepeatedStringField field: Int, data: Data) -> [String] {
@@ -492,6 +741,44 @@ struct ProtoReader {
         default: return false
         }
     }
+
+    mutating func readRawField() -> RawProtoField? {
+        let start = index
+        guard let tag = readTag() else { return nil }
+        var payload: Data?
+        var varint: UInt64?
+        switch tag.wireType {
+        case 0:
+            varint = readVarint()
+            guard varint != nil else { return nil }
+        case 1:
+            guard index + 8 <= data.count else { return nil }
+            index += 8
+        case 2:
+            payload = readLengthDelimited()
+            guard payload != nil else { return nil }
+        case 5:
+            guard index + 4 <= data.count else { return nil }
+            index += 4
+        default:
+            return nil
+        }
+        return RawProtoField(
+            field: tag.field,
+            wireType: tag.wireType,
+            payload: payload,
+            varint: varint,
+            raw: Data(data[start ..< index])
+        )
+    }
+}
+
+struct RawProtoField {
+    var field: Int
+    var wireType: Int
+    var payload: Data?
+    var varint: UInt64?
+    var raw: Data
 }
 
 struct LossyList<Element: Decodable>: Decodable {
@@ -510,6 +797,8 @@ struct LossyList<Element: Decodable>: Decodable {
         }
     }
 }
+
+extension LossyList: Sendable where Element: Sendable {}
 
 struct LossyValue<Element: Decodable>: Decodable {
     var value: Element?
@@ -532,10 +821,28 @@ struct UserNameplateAssetsDTO: Decodable {
 }
 
 struct UserNameplateDTO: Decodable {
+    var skuID: String?
     var asset: String?
     var label: String?
     var palette: String?
     var assets: UserNameplateAssetsDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case skuID = "sku_id"
+        case asset, label, palette, assets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        skuID = try? container.decode(String.self, forKey: .skuID)
+        if skuID == nil, let numericSKU = try? container.decode(UInt64.self, forKey: .skuID) {
+            skuID = numericSKU.description
+        }
+        asset = try container.decodeIfPresent(String.self, forKey: .asset)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+        palette = try container.decodeIfPresent(String.self, forKey: .palette)
+        assets = try container.decodeIfPresent(UserNameplateAssetsDTO.self, forKey: .assets)
+    }
 }
 
 struct UserCollectiblesDTO: Decodable {
@@ -570,6 +877,7 @@ struct UserDTO: Decodable {
 
     var id: String
     var username: String?
+    var discriminator: String?
     var globalName: String?
     var avatar: String?
     var bot: Bool?
@@ -584,7 +892,7 @@ struct UserDTO: Decodable {
     var primaryGuild: PrimaryGuildDTO?
     var displayNameStyles: DisplayNameStyleDTO?
     enum CodingKeys: String, CodingKey {
-        case id, username
+        case id, username, discriminator
         case globalName = "global_name"
         case avatar, bot, system, banner
         case accentColor = "accent_color"
@@ -595,6 +903,36 @@ struct UserDTO: Decodable {
         case collectibles
         case primaryGuild = "primary_guild"
         case displayNameStyles = "display_name_styles"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Identity is the only required user-store field. Discord frequently
+        // evolves optional profile cosmetics independently; a type change in
+        // one of those fields must not make LossyList discard the entire user
+        // from READY/READY_SUPPLEMENTAL and account-wide search.
+        id = try container.decode(String.self, forKey: .id)
+        username = try? container.decode(String.self, forKey: .username)
+        discriminator = try? container.decode(String.self, forKey: .discriminator)
+        globalName = try? container.decode(String.self, forKey: .globalName)
+        avatar = try? container.decode(String.self, forKey: .avatar)
+        bot = try? container.decode(Bool.self, forKey: .bot)
+        system = try? container.decode(Bool.self, forKey: .system)
+        banner = try? container.decode(String.self, forKey: .banner)
+        accentColor = try? container.decode(UInt32.self, forKey: .accentColor)
+        bio = try? container.decode(String.self, forKey: .bio)
+        publicFlags = try? container.decode(UInt64.self, forKey: .publicFlags)
+        premiumType = try? container.decode(Int.self, forKey: .premiumType)
+        avatarDecorationData = try? container.decode(
+            AvatarDecorationDTO.self,
+            forKey: .avatarDecorationData
+        )
+        collectibles = try? container.decode(UserCollectiblesDTO.self, forKey: .collectibles)
+        primaryGuild = try? container.decode(PrimaryGuildDTO.self, forKey: .primaryGuild)
+        displayNameStyles = try? container.decode(
+            DisplayNameStyleDTO.self,
+            forKey: .displayNameStyles
+        )
     }
 
     func domain() throws -> User {
@@ -611,13 +949,26 @@ struct UserDTO: Decodable {
             URL(string: "https://cdn.discordapp.com/avatar-decoration-presets/\($0).png?size=160")
         }
         let nameplate = collectibles?.nameplate.flatMap { value -> Nameplate? in
-            guard let asset = value.asset else { return nil }
-            let path = asset.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let legacyPath = value.asset?.trimmingCharacters(
+                in: CharacterSet(charactersIn: "/")
+            )
+            let officialBase = value.skuID.map {
+                "https://cdn.discordapp.com/media/v1/collectibles-shop/\($0)"
+            }
+            let staticURL = officialBase.flatMap { URL(string: "\($0)/static") }
+                ?? value.assets?.staticImageURL.flatMap(URL.init)
+                ?? legacyPath.flatMap {
+                    URL(string: "https://cdn.discordapp.com/assets/collectibles/\($0)/static.png")
+                }
+            let animatedURL = officialBase.flatMap { URL(string: "\($0)/animated") }
+                ?? value.assets?.animatedImageURL.flatMap(URL.init)
+                ?? legacyPath.flatMap {
+                    URL(string: "https://cdn.discordapp.com/assets/collectibles/\($0)/img.png")
+                }
+            guard staticURL != nil || animatedURL != nil else { return nil }
             return Nameplate(
-                staticURL: URL(
-                    string: "https://cdn.discordapp.com/assets/collectibles/\(path)/static.png"),
-                animatedURL: URL(
-                    string: "https://cdn.discordapp.com/assets/collectibles/\(path)/img.png"),
+                staticURL: staticURL,
+                animatedURL: animatedURL,
                 label: value.label ?? "",
                 palette: value.palette ?? "none"
             )
@@ -642,6 +993,7 @@ struct UserDTO: Decodable {
         return User(
             id: id,
             username: username ?? id.description,
+            discriminator: discriminator ?? "0",
             displayName: globalName ?? username ?? id.description,
             avatarURL: avatarURL,
             isBot: bot ?? false,
@@ -783,9 +1135,9 @@ struct ProfileGuildMemberDTO: Decodable {
     var bio: String?
 }
 
-struct ProfileEffectConfigDTO: Decodable {
-    struct AnimationDTO: Decodable {
-        struct SourceDTO: Decodable { var src: String? }
+struct ProfileEffectConfigDTO: Decodable, Sendable {
+    struct AnimationDTO: Decodable, Sendable {
+        struct SourceDTO: Decodable, Sendable { var src: String? }
 
         var src: String?
         var loop: Bool?
@@ -844,7 +1196,7 @@ struct ProfileEffectConfigDTO: Decodable {
     }
 }
 
-struct ProfileEffectPositionDTO: Decodable {
+struct ProfileEffectPositionDTO: Decodable, Sendable {
     var horizontal: Int?
     var vertical: Int?
 
@@ -854,12 +1206,7 @@ struct ProfileEffectPositionDTO: Decodable {
     }
 }
 
-struct ProfileEffectsDTO: Decodable {
-    var profileEffectConfigs: LossyList<ProfileEffectConfigDTO>?
-    enum CodingKeys: String, CodingKey { case profileEffectConfigs = "profile_effect_configs" }
-}
-
-struct CollectibleProductDTO: Decodable {
+struct CollectibleProductDTO: Decodable, Sendable {
     var items: LossyList<ProfileEffectConfigDTO>?
 }
 
@@ -994,7 +1341,10 @@ struct ThreadMemberDTO: Decodable {
         }
     }
 
-    var id: String
+    // Discord omits both identifiers when a thread member is embedded in a
+    // channel object from READY/GUILD_CREATE. They are present on standalone
+    // thread-member events and list responses.
+    var id: String?
     var userID: String?
     var flags: UInt64?
     var muted: Bool?
@@ -1027,10 +1377,11 @@ struct GuildDTO: Decodable {
     var owner: Bool?
     var permissions: String?
     var rulesChannelID: String?
+    var features: Set<String>?
     var defaultMessageNotifications: Int?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, icon, owner, permissions
+        case id, name, icon, owner, permissions, features
         case rulesChannelID = "rules_channel_id"
         case defaultMessageNotifications = "default_message_notifications"
     }
@@ -1052,6 +1403,7 @@ struct GuildDTO: Decodable {
             isOwnedByCurrentUser: owner,
             currentUserPermissions: permissions.flatMap(UInt64.init),
             rulesChannelID: rulesChannelID.flatMap(ChannelID.init),
+            features: features ?? [],
             defaultMessageNotifications:
                 defaultMessageNotifications.flatMap(MessageNotificationLevel.init(rawValue:))
                 ?? .onlyMentions
@@ -1134,6 +1486,7 @@ struct ChannelDTO: Decodable {
     var recipients: [UserDTO]?
     var recipientIDs: [String]?
     var permissionOverwrites: [PermissionOverwriteDTO]?
+    var memberListID: String?
     var lastMessageID: String?
     var lastPinTimestamp: String?
     var ownerID: String?
@@ -1153,6 +1506,8 @@ struct ChannelDTO: Decodable {
     var defaultAutoArchiveDuration: Int?
     var defaultThreadRateLimitPerUser: Int?
     var rateLimitPerUser: Int?
+    var status: String?
+    var voiceStartTime: DiscordTimestampDTO?
     var message: MessageDTO?
     enum CodingKeys: String, CodingKey {
         case id
@@ -1162,6 +1517,7 @@ struct ChannelDTO: Decodable {
         case position, recipients
         case recipientIDs = "recipient_ids"
         case permissionOverwrites = "permission_overwrites"
+        case memberListID = "member_list_id"
         case lastMessageID = "last_message_id"
         case lastPinTimestamp = "last_pin_timestamp"
         case ownerID = "owner_id"
@@ -1179,6 +1535,8 @@ struct ChannelDTO: Decodable {
         case defaultAutoArchiveDuration = "default_auto_archive_duration"
         case defaultThreadRateLimitPerUser = "default_thread_rate_limit_per_user"
         case rateLimitPerUser = "rate_limit_per_user"
+        case status
+        case voiceStartTime = "voice_start_time"
     }
 
     func domain(
@@ -1187,15 +1545,21 @@ struct ChannelDTO: Decodable {
         categoryPosition: Int = 0,
         knownUsersByID: [String: UserDTO] = [:]
     ) throws -> Channel {
+        let channelIDString = id
         guard let id = ChannelID(id) else {
             throw ChatProviderError.invalidRequest(
                 "Discord returned an invalid channel identifier.")
         }
         let guild = guildID.flatMap(GuildID.init) ?? fallbackGuildID
-        let recipientDTOs =
+        let unresolvedRecipientDTOs =
             recipients
             ?? recipientIDs?.compactMap { knownUsersByID[$0] }
             ?? []
+        let recipientDTOs = DiscordPrivateRecipientOrdering.sortedUsers(
+            unresolvedRecipientDTOs,
+            channelID: channelIDString,
+            channelType: type
+        )
         let users = try recipientDTOs.map { try $0.domain() }
         let kind: ChannelKindValue =
             switch type {
@@ -1203,10 +1567,28 @@ struct ChannelDTO: Decodable {
             case 3: .groupDirectMessage
             case 2, 13: .voice
             case 5: .announcement
-            case 15: .forum
+            // Media channels (16) share the forum-style surface locally. The
+            // distinction is not yet rendered separately, but retaining them
+            // as non-text destinations is required for forwarding eligibility.
+            case 15, 16: .forum
             default: .text
             }
-        let resolvedName = name ?? users.map(\.displayName).joined(separator: ", ")
+        let explicitName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let recipientName = users.map(\.displayName).joined(separator: ", ")
+        let ownerGroupName = ownerID
+            .flatMap { knownUsersByID[$0] }
+            .flatMap { try? $0.domain().displayName }
+            .map { "\($0)'s Group" }
+        let resolvedName: String
+        if let explicitName, !explicitName.isEmpty {
+            resolvedName = explicitName
+        } else if !recipientName.isEmpty {
+            resolvedName = recipientName
+        } else if type == 3, let ownerGroupName {
+            resolvedName = ownerGroupName
+        } else {
+            resolvedName = type == 3 ? "Group Direct Message" : "Direct Message"
+        }
         let iconURL = icon.flatMap { hash in
             URL(
                 string:
@@ -1216,7 +1598,8 @@ struct ChannelDTO: Decodable {
         return Channel(
             id: id,
             guildID: guild,
-            name: resolvedName.isEmpty ? "Direct Message" : resolvedName,
+            name: resolvedName,
+            hasExplicitName: explicitName?.isEmpty == false,
             iconURL: iconURL,
             ownerID: ownerID.flatMap(UserID.init),
             topic: topic,
@@ -1227,6 +1610,7 @@ struct ChannelDTO: Decodable {
             categoryPosition: categoryPosition,
             recipients: users,
             permissionOverwrites: permissionOverwrites?.map(\.domain),
+            memberListID: memberListID,
             lastMessageID: lastMessageID.flatMap(MessageID.init),
             lastPinTimestamp: lastPinTimestamp.flatMap(DiscordDate.parse),
             flags: flags ?? 0,
@@ -1240,7 +1624,9 @@ struct ChannelDTO: Decodable {
             defaultTagMatch: defaultTagSetting.flatMap(ForumTagMatch.init(rawValue:)) ?? .matchSome,
             defaultAutoArchiveDuration: defaultAutoArchiveDuration,
             defaultThreadRateLimitPerUser: defaultThreadRateLimitPerUser,
-            rateLimitPerUser: rateLimitPerUser ?? 0
+            rateLimitPerUser: rateLimitPerUser ?? 0,
+            voiceStatus: status,
+            voiceStartTime: voiceStartTime?.date
         )
     }
 
@@ -1281,6 +1667,62 @@ struct ChannelDTO: Decodable {
             mostRecentMessage: nil,
             isUnread: false
         )
+    }
+}
+
+/// Discord's private-channel model does not preserve the server's recipient
+/// array order. It orders each recipient by the signed 32-bit result of the
+/// JavaScript expressions `parseInt(userID) ^ parseInt(channelID)`. Parsing via
+/// `Double` intentionally preserves JavaScript's precision loss for snowflakes.
+enum DiscordPrivateRecipientOrdering {
+    static func sortedUsers(
+        _ users: [UserDTO],
+        channelID: String,
+        channelType: Int
+    ) -> [UserDTO] {
+        guard channelType == 1 || channelType == 3 else { return users }
+        return stableSort(users, channelID: channelID, id: \UserDTO.id)
+    }
+
+    static func sortedIDs(
+        _ ids: [String],
+        channelID: String,
+        channelType: Int
+    ) -> [String] {
+        guard channelType == 1 || channelType == 3 else { return ids }
+        return stableSort(ids, channelID: channelID, id: { $0 })
+    }
+
+    static func sortedDomainUsers(
+        _ users: [User],
+        channelID: String,
+        channelType: Int
+    ) -> [User] {
+        guard channelType == 1 || channelType == 3 else { return users }
+        return stableSort(users, channelID: channelID, id: { $0.id.description })
+    }
+
+    private static func stableSort<Value>(
+        _ values: [Value],
+        channelID: String,
+        id: (Value) -> String
+    ) -> [Value] {
+        let channelBits = javascriptInt32Bits(channelID)
+        return values.enumerated().sorted { lhs, rhs in
+            let left = Int32(bitPattern: javascriptInt32Bits(id(lhs.element)) ^ channelBits)
+            let right = Int32(bitPattern: javascriptInt32Bits(id(rhs.element)) ^ channelBits)
+            if left != right { return left < right }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    private static func javascriptInt32Bits(_ value: String) -> UInt32 {
+        guard let parsed = Double(value), parsed.isFinite else { return 0 }
+        let modulus = 4_294_967_296.0
+        var remainder = parsed.rounded(.towardZero)
+            .truncatingRemainder(dividingBy: modulus)
+        if remainder < 0 { remainder += modulus }
+        return UInt32(remainder)
     }
 }
 
@@ -1482,234 +1924,6 @@ struct MessageMentionDTO: Decodable {
         }
         return value
     }
-}
 
-struct MessageDeleteDTO: Decodable {
-    var id: String
-    var channelID: String
-    enum CodingKeys: String, CodingKey {
-        case id
-        case channelID = "channel_id"
-    }
-}
-
-struct GatewayMessageReactionUserDTO: Decodable {
-    var userID: String
-    var channelID: String
-    var messageID: String
-    var emoji: ReactionDTO.EmojiDTO
-    var type: Int?
-    var burst: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case userID = "user_id"
-        case channelID = "channel_id"
-        case messageID = "message_id"
-        case emoji, type, burst
-    }
-
-    func domainUpdate(isAddition: Bool) -> MessageReactionUpdate? {
-        guard
-            let channelID = ChannelID(channelID),
-            let messageID = MessageID(messageID),
-            let userID = UserID(userID),
-            let kind = MessageReactionKind(rawValue: type ?? (burst == true ? 1 : 0))
-        else { return nil }
-        if isAddition {
-            return .add(
-                channelID: channelID,
-                messageID: messageID,
-                userID: userID,
-                emoji: emoji.domainToken,
-                kind: kind
-            )
-        }
-        return .remove(
-            channelID: channelID,
-            messageID: messageID,
-            userID: userID,
-            emoji: emoji.domainToken,
-            kind: kind
-        )
-    }
-}
-
-struct GatewayMessageReactionRemoveAllDTO: Decodable {
-    var channelID: String
-    var messageID: String
-
-    enum CodingKeys: String, CodingKey {
-        case channelID = "channel_id"
-        case messageID = "message_id"
-    }
-
-    var domainUpdate: MessageReactionUpdate? {
-        guard let channelID = ChannelID(channelID), let messageID = MessageID(messageID) else {
-            return nil
-        }
-        return .removeAll(channelID: channelID, messageID: messageID)
-    }
-}
-
-struct GatewayMessageReactionRemoveEmojiDTO: Decodable {
-    var channelID: String
-    var messageID: String
-    var emoji: ReactionDTO.EmojiDTO
-
-    enum CodingKeys: String, CodingKey {
-        case channelID = "channel_id"
-        case messageID = "message_id"
-        case emoji
-    }
-
-    var domainUpdate: MessageReactionUpdate? {
-        guard let channelID = ChannelID(channelID), let messageID = MessageID(messageID) else {
-            return nil
-        }
-        return .removeEmoji(
-            channelID: channelID,
-            messageID: messageID,
-            emoji: emoji.domainToken
-        )
-    }
-}
-
-struct TypingStartDTO: Decodable {
-    var channelID: String
-    var guildID: String?
-    var userID: String
-    var member: GuildMemberDTO?
-    var user: UserDTO?
-
-    enum CodingKeys: String, CodingKey {
-        case channelID = "channel_id"
-        case guildID = "guild_id"
-        case userID = "user_id"
-        case member, user
-    }
-}
-
-struct MessageUpdateDTO: Decodable {
-    var id: String
-    var channelID: String
-    var content: String?
-    var editedTimestamp: String?
-    var attachments: LossyList<AttachmentDTO>?
-    var embeds: LossyList<MessageEmbedDTO>?
-    var components: LossyList<MessageComponentDTO>?
-    var stickerItems: LossyList<MessageStickerDTO>?
-    var stickers: LossyList<MessageStickerDTO>?
-    var thread: MessageThreadDTO?
-    var mentions: LossyList<MessageMentionDTO>?
-    var mentionRoles: [String]?
-    var mentionEveryone: Bool?
-    var flags: UInt64?
-    var type: Int?
-    var application: MessageDTO.ApplicationDTO?
-    var interaction: MessageDTO.InteractionDTO?
-    var interactionMetadata: MessageDTO.InteractionMetadataDTO?
-    enum CodingKeys: String, CodingKey {
-        case id
-        case channelID = "channel_id"
-        case content
-        case editedTimestamp = "edited_timestamp"
-        case attachments
-        case embeds, components, stickers, thread, flags, type, mentions, application, interaction
-        case mentionRoles = "mention_roles"
-        case mentionEveryone = "mention_everyone"
-        case interactionMetadata = "interaction_metadata"
-        case stickerItems = "sticker_items"
-    }
-
-    func apply(to message: inout Message) {
-        if let content {
-            message.content = content
-        }
-        if let editedTimestamp {
-            message.editedTimestamp = DiscordDate.parse(editedTimestamp)
-        }
-        if let attachments {
-            message.attachments = attachments.elements.compactMap { try? $0.domain() }
-        }
-        if let embeds {
-            message.embeds = embeds.elements.enumerated().map {
-                $0.element.domain(index: $0.offset)
-            }
-        }
-        if let components {
-            message.components = components.elements.enumerated().map {
-                $0.element.domain(path: "\($0.offset)")
-            }
-        }
-        if let stickers = stickerItems ?? stickers {
-            message.stickers = stickers.elements.map(\.domain)
-        }
-        if let thread {
-            message.thread = thread.domain
-        }
-        if let flags {
-            message.flags = MessageFlags(rawValue: flags)
-        }
-        if let type {
-            message.type = DiscordMessageType(rawValue: type)
-        }
-        if let application {
-            message.application = application.domain
-            message.applicationID = ApplicationID(application.id)
-        }
-        if interaction != nil || interactionMetadata != nil {
-            message.interactionMetadata = MessageInteractionMetadata(
-                id: interactionMetadata?.id ?? interaction?.id,
-                type: interactionMetadata?.type ?? interaction?.type ?? 2,
-                name: interactionMetadata?.name ?? interaction?.name,
-                localizedName: interactionMetadata?.localizedName ?? interaction?.localizedName,
-                user: (interactionMetadata?.user ?? interaction?.user).flatMap { try? $0.domain() },
-                applicationID: interactionMetadata?.applicationID
-                    ?? message.applicationID?.description,
-                originalResponseMessageID: interactionMetadata?.originalResponseMessageID.flatMap(
-                    MessageID.init
-                )
-            )
-        }
-        if let mentions {
-            message.mentionedUsers = mentions.elements.compactMap {
-                try? $0.domain(guildID: message.guildID)
-            }
-        }
-        if let mentionRoles {
-            message.mentionedRoleIDs = mentionRoles.compactMap(RoleID.init)
-        }
-        if let mentionEveryone {
-            message.mentionsEveryone = mentionEveryone
-        }
-    }
-}
-
-struct GuildMemberListUpdateDTO: Decodable {
-    struct Group: Decodable {
-        var id: String
-        var count: Int
-    }
-
-    struct Operation: Decodable {
-        var op: String
-        var range: [Int]?
-        var index: Int?
-        var items: [Item]?
-        var item: Item?
-    }
-
-    struct Item: Decodable {
-        var member: GuildMemberDTO?
-        var presence: GuildPresenceDTO?
-    }
-
-    var guildID: String
-    var ops: [Operation]
-    var groups: [Group]?
-    enum CodingKeys: String, CodingKey {
-        case guildID = "guild_id"
-        case ops
-        case groups
-    }
+    var searchIndexUser: UserDTO { user }
 }

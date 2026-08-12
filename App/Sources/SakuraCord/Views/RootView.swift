@@ -12,16 +12,20 @@ struct RootView: View {
             ChatRootView(model: model)
         case .signedOut:
             if model.launchMode == .normal {
-                DiscordLoginView(
-                    showsCancel: false,
-                    networkingEnabled: !model.isDiscordNetworkingDisabled
-                ) { handle in
-                    await model.connectAuthenticatedAccount(
-                        handle,
-                        preservesInteractivePresentation: true
-                    )
-                        ? nil
-                        : (model.errorMessage ?? "Discord account bootstrap failed for an unknown reason.")
+                if model.savedAccounts.isEmpty {
+                    DiscordLoginView(
+                        showsCancel: false,
+                        networkingEnabled: !model.isDiscordNetworkingDisabled
+                    ) { credential in
+                        await model.connectPendingAuthenticatedAccount(
+                            credential,
+                            preservesInteractivePresentation: true
+                        )
+                            ? nil
+                            : (model.errorMessage ?? "Discord account bootstrap failed for an unknown reason.")
+                    }
+                } else {
+                    AccountSwitcherView(model: model, showsCancel: false)
                 }
             } else {
                 SakuraCordSessionLoadingView(
@@ -32,7 +36,8 @@ struct RootView: View {
         case .restoring, .connecting:
             SakuraCordSessionLoadingView(
                 state: model.sessionState,
-                isOfflineTesting: model.isOfflineTesting
+                isOfflineTesting: model.isOfflineTesting,
+                isAccountSwitch: model.isSwitchingAccounts
             )
         }
     }
@@ -40,20 +45,16 @@ struct RootView: View {
 
 private struct ChatRootView: View {
     let model: AppModel
-    @State private var showLogin = false
+    @State private var showAccountSwitcher = false
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var supplementaryPaneFrame = CGRect.zero
     @State private var workspaceFrame = CGRect.zero
+    @State private var sidebarWidth = ChatChromeMetrics.serverRailWidth + 230
     @State private var presentsForumComposer = false
     @State private var isFileDropTargeted = false
     @State private var isInstantUpload = false
     @State private var hoveredFileDropDestination: MessageComposerDestination?
-
-    private let modifierFlagTimer = Timer.publish(
-        every: 0.05,
-        on: .main,
-        in: .common
-    ).autoconnect()
+    @State private var modifierPollingTask: Task<Void, Never>?
 
     var body: some View {
         @Bindable var model = model
@@ -65,7 +66,26 @@ private struct ChatRootView: View {
                     selectedGuildID: model.selectedGuildID,
                     homeIsUnread: model.directMessageUnread,
                     homeMentionCount: model.directMessageMentionCount,
-                    selectHome: { model.selectGuild(nil) }, selectGuild: model.selectGuild
+                    selectHome: { model.selectGuild(nil) },
+                    selectGuild: model.selectGuild,
+                    contextMenuActions: ServerRailContextMenuActions(
+                        settings: model.guildNotificationSettings,
+                        isMutationPending: model.isGuildNotificationMutationPending,
+                        markRead: model.markGuildRead,
+                        mute: { guild, duration in
+                            model.setGuildMute(
+                                true,
+                                until: duration.endDate(),
+                                for: guild
+                            )
+                        },
+                        unmute: { guild in
+                            model.setGuildMute(false, until: nil, for: guild)
+                        },
+                        setNotificationLevel: { guild, level in
+                            model.setGuildNotificationLevel(level, for: guild)
+                        }
+                    )
                 )
                 .zIndex(200)
                 ChannelSidebarView(
@@ -81,12 +101,18 @@ private struct ChatRootView: View {
                     activeVoiceChannelID: model.activeVoiceChannel?.id,
                     connectAccount: {
                         if !model.isOfflineTesting {
-                            showLogin = true
+                            showAccountSwitcher = true
                         }
                     },
-                    logout: { await model.logout() },
                     updateStatus: { await model.updateStatus($0) }
                 )
+            }
+            .opacity(model.isSwitchingAccounts ? 0 : 1)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.width
+            } action: { width in
+                guard width.isFinite, width > ChatChromeMetrics.serverRailWidth else { return }
+                sidebarWidth = width
             }
             .navigationSplitViewColumnWidth(
                 min: ChatChromeMetrics.serverRailWidth + 190,
@@ -98,6 +124,7 @@ private struct ChatRootView: View {
                 model: model,
                 presentsForumComposer: $presentsForumComposer
             )
+            .opacity(model.isSwitchingAccounts ? 0 : 1)
             .navigationTitle("")
             .toolbar {
                 detailToolbar
@@ -109,15 +136,26 @@ private struct ChatRootView: View {
         .overlay(alignment: .topLeading) {
             ZStack(alignment: .topLeading) {
                 if columnVisibility != .detailOnly {
-                    Text(sidebarDisplayName)
-                        .font(.title3.weight(.semibold))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(width: 150, height: 28, alignment: .leading)
+                    if model.isSwitchingAccounts {
+                        SkeletonShimmerTimeline {
+                            SkeletonShape(cornerRadius: 4)
+                                .frame(width: 132, height: 14)
+                        }
                         .offset(
                             x: ChatChromeMetrics.sidebarTitleLeadingOffset,
-                            y: ChatChromeMetrics.sidebarTitleTopOffset
+                            y: ChatChromeMetrics.sidebarTitleTopOffset + 7
                         )
+                    } else {
+                        Text(sidebarDisplayName)
+                            .font(.title3.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(width: 150, height: 28, alignment: .leading)
+                            .offset(
+                                x: ChatChromeMetrics.sidebarTitleLeadingOffset,
+                                y: ChatChromeMetrics.sidebarTitleTopOffset
+                            )
+                    }
                 }
             }
             .ignoresSafeArea()
@@ -127,6 +165,18 @@ private struct ChatRootView: View {
             if !model.incomingPrivateCalls.isEmpty {
                 IncomingPrivateCallOverlay(model: model)
                     .zIndex(500)
+            }
+        }
+        .overlay {
+            if model.isSwitchingAccounts {
+                SakuraCordSessionLoadingView(
+                    state: .connecting,
+                    isOfflineTesting: false,
+                    isAccountSwitch: true,
+                    isEmbeddedInWorkspace: true,
+                    embeddedSidebarWidth: sidebarWidth
+                )
+                .zIndex(1_000)
             }
         }
         .background {
@@ -139,6 +189,26 @@ private struct ChatRootView: View {
                 )
             }
             .frame(width: 0, height: 0)
+        }
+        .background {
+            MediaViewerWindowOverlay(
+                presentation: model.mediaViewerPresentation,
+                dismiss: { model.mediaViewerPresentation = nil }
+            )
+            .frame(width: 0, height: 0)
+        }
+        .background {
+            ForwardMessageWindowOverlay(model: model)
+                .frame(width: 0, height: 0)
+        }
+        .background {
+            DisplayCompleteFrameReporter(
+                presentationID: model.selectedChannelID?.rawValue
+            ) {
+                guard model.selectedChannelID == nil else { return }
+                AppPerformanceSignposts.reportNonTimelineWorkspaceFrame()
+            }
+            .frame(width: 1, height: 1)
         }
         .overlay {
             if presentsForumComposer,
@@ -187,12 +257,36 @@ private struct ChatRootView: View {
                 isInstantUpload = targeted && NSEvent.modifierFlags.contains(.shift)
                 hoveredFileDropDestination =
                     targeted ? composerDestinationForCurrentPointer() : nil
+                updateModifierPolling(isTargeted: targeted)
             }
         )
-        .onReceive(modifierFlagTimer) { _ in
-            guard isFileDropTargeted else { return }
-            isInstantUpload = NSEvent.modifierFlags.contains(.shift)
-            hoveredFileDropDestination = composerDestinationForCurrentPointer()
+        .overlay {
+            ComposerPromisedFileDropBridge(
+                isEnabled: canAcceptWindowDrops,
+                targetChanged: { targeted, location, instant in
+                    let destination = targeted ? composerDestination(at: location) : nil
+                    isFileDropTargeted = destination != nil
+                    isInstantUpload = destination != nil && instant
+                    hoveredFileDropDestination = destination
+                },
+                receiveFiles: { batch, location, instant in
+                    guard let destination = composerDestination(at: location) else {
+                        batch.discard()
+                        return
+                    }
+                    if instant {
+                        sendDroppedPromisedAttachmentsImmediately(
+                            batch,
+                            to: destination
+                        )
+                    } else {
+                        model.addPromisedComposerAttachments(
+                            batch,
+                            to: destination
+                        )
+                    }
+                }
+            )
         }
         .onPreferenceChange(ThreadPaneFramePreferenceKey.self) { frame in
             supplementaryPaneFrame = frame
@@ -202,20 +296,72 @@ private struct ChatRootView: View {
                 supplementaryPaneFrame = .zero
             }
         }
-        .onChange(of: model.selectedChannelID) {
+        .onChange(of: model.selectedChannelID) { _, channelID in
             presentsForumComposer = false
+            model.mediaViewerPresentation = nil
+            AppPerformanceSignposts.expectStartupConversation(channelID)
         }
-        .sheet(isPresented: $showLogin) {
-            DiscordLoginView(
+        .onAppear {
+            AppPerformanceSignposts.expectStartupConversation(
+                model.selectedChannelID
+            )
+        }
+        .onDisappear {
+            modifierPollingTask?.cancel()
+            modifierPollingTask = nil
+            model.mediaViewerPresentation = nil
+        }
+        .sheet(isPresented: $showAccountSwitcher) {
+            AccountSwitcherView(
+                model: model,
                 showsCancel: true,
-                networkingEnabled: !model.isDiscordNetworkingDisabled
-            ) { handle in
-                await model.connectAuthenticatedAccount(
-                    handle,
-                    preservesInteractivePresentation: true
-                )
-                    ? nil
-                    : (model.errorMessage ?? "Discord account bootstrap failed for an unknown reason.")
+                accountActivated: { showAccountSwitcher = false }
+            )
+        }
+        .alert(
+            "File Too Large",
+            isPresented: oversizedAttachmentPromptIsPresented,
+            presenting: model.oversizedAttachmentPrompt
+        ) { prompt in
+            if prompt.availableServices.contains(.catbox) {
+                Button("Upload to Catbox (Permanent)") {
+                    model.uploadOversizedAttachment(prompt, using: .catbox)
+                }
+            }
+            if prompt.availableServices.contains(.litterbox) {
+                Button("Upload to Litterbox (24 Hours)") {
+                    model.uploadOversizedAttachment(prompt, using: .litterbox)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                model.dismissOversizedAttachmentPrompt(id: prompt.id)
+            }
+        } message: { prompt in
+            Text(model.oversizedAttachmentMessage(prompt))
+        }
+        .overlay {
+            if let upload = model.externalAttachmentUploadPresentation {
+                ZStack {
+                    Color.black.opacity(0.28)
+                        .ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Uploading to \(upload.service.displayName)…")
+                            .font(.headline)
+                        Text(upload.fileName)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Button("Cancel", role: .cancel) {
+                            model.cancelExternalAttachmentUpload()
+                        }
+                    }
+                    .padding(24)
+                    .frame(minWidth: 280)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .shadow(radius: 18)
+                }
             }
         }
         .alert("SakuraCord", isPresented: Binding(get: { model.errorMessage != nil }, set: {
@@ -234,50 +380,91 @@ private struct ChatRootView: View {
         }
     }
 
+    private func updateModifierPolling(isTargeted: Bool) {
+        modifierPollingTask?.cancel()
+        modifierPollingTask = nil
+        guard isTargeted else { return }
+        modifierPollingTask = Task { @MainActor in
+            while !Task.isCancelled {
+                isInstantUpload = NSEvent.modifierFlags.contains(.shift)
+                hoveredFileDropDestination = composerDestinationForCurrentPointer()
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    private var oversizedAttachmentPromptIsPresented: Binding<Bool> {
+        let presentedID = model.oversizedAttachmentPrompt?.id
+        return Binding(
+            get: { model.oversizedAttachmentPrompt != nil },
+            set: { isPresented in
+                if !isPresented {
+                    model.dismissOversizedAttachmentPrompt(id: presentedID)
+                }
+            }
+        )
+    }
+
     @ToolbarContentBuilder
     private var conversationToolbar: some ToolbarContent {
-        if let channel = model.selectedChannel {
+        if model.isSwitchingAccounts {
             ToolbarItem(placement: .navigation) {
-                ConversationToolbarLabel(
-                    title: channel.name,
-                    systemImage: channelToolbarSymbol(channel),
-                    subtitle: isDirectMessageSelected
-                        ? directMessageToolbarSubtitle(for: channel)
-                        : nil
-                )
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
+                SkeletonShimmerTimeline {
+                    HStack(spacing: 8) {
+                        SkeletonShape(cornerRadius: 4)
+                            .frame(width: 16, height: 16)
+                        SkeletonShape(cornerRadius: 4)
+                            .frame(width: 112, height: 13)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                }
             }
             .highVisibilityPriorityIfAvailable()
-        }
-
-        if let presentation = supplementaryToolbarPresentation {
-            ToolbarItem {
-                HStack(spacing: 0) {
+        } else {
+            if let channel = model.selectedChannel {
+                ToolbarItem(placement: .navigation) {
                     ConversationToolbarLabel(
-                        title: presentation.title,
-                        systemImage: presentation.systemImage,
-                        subtitle: presentation.subtitle
+                        title: channel.name,
+                        systemImage: channelToolbarSymbol(channel),
+                        subtitle: isDirectMessageSelected
+                            ? directMessageToolbarSubtitle(for: channel)
+                            : nil
                     )
-                    Spacer(minLength: 0)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
                 }
-                .frame(
-                    width: max(supplementaryPaneFrame.width - 64, 120),
-                    alignment: .leading
-                )
+                .highVisibilityPriorityIfAvailable()
             }
-            .highVisibilityPriorityIfAvailable()
-        }
 
-        if hasOpenSupplementaryConversation {
-            ToolbarItem {
-                Button(action: closeSupplementaryConversation) {
-                    Label("Close conversation", systemImage: "xmark")
-                        .labelStyle(.iconOnly)
+            if let presentation = supplementaryToolbarPresentation {
+                ToolbarItem {
+                    HStack(spacing: 0) {
+                        ConversationToolbarLabel(
+                            title: presentation.title,
+                            systemImage: presentation.systemImage,
+                            subtitle: presentation.subtitle
+                        )
+                        Spacer(minLength: 0)
+                    }
+                    .frame(
+                        width: max(supplementaryPaneFrame.width - 64, 120),
+                        alignment: .leading
+                    )
                 }
-                .help(model.openThread == nil ? "Close voice channel chat" : "Close thread")
+                .highVisibilityPriorityIfAvailable()
             }
-            .highVisibilityPriorityIfAvailable()
+
+            if hasOpenSupplementaryConversation {
+                ToolbarItem {
+                    Button(action: closeSupplementaryConversation) {
+                        Label("Close conversation", systemImage: "xmark")
+                            .labelStyle(.iconOnly)
+                    }
+                    .help(model.openThread == nil ? "Close voice channel chat" : "Close thread")
+                }
+                .highVisibilityPriorityIfAvailable()
+            }
         }
     }
 
@@ -285,74 +472,89 @@ private struct ChatRootView: View {
     private var detailToolbar: some ToolbarContent {
         ToolbarSpacer(.flexible)
 
-        if let channel = selectedPrivateChannel {
-            ToolbarItemGroup {
-                Button {
-                    Task {
-                        if model.privateCall(in: channel.id) != nil {
-                            await model.joinPrivateCall(in: channel)
-                        } else {
-                            await model.startPrivateCall(in: channel)
-                        }
+        if model.isSwitchingAccounts {
+            ToolbarItem {
+                SkeletonShimmerTimeline {
+                    HStack(spacing: 0) {
+                        SkeletonShape(cornerRadius: 6)
+                            .frame(width: 20, height: 20)
                     }
-                } label: {
-                    Label(
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .fixedSize()
+                }
+            }
+            .highVisibilityPriorityIfAvailable()
+        } else {
+            if let channel = selectedPrivateChannel {
+                ToolbarItemGroup {
+                    Button {
+                        Task {
+                            if model.privateCall(in: channel.id) != nil {
+                                await model.joinPrivateCall(in: channel)
+                            } else {
+                                await model.startPrivateCall(in: channel)
+                            }
+                        }
+                    } label: {
+                        Label(
+                            model.privateCall(in: channel.id) == nil
+                                ? "Start Voice Call" : "Join Voice Call",
+                            systemImage: "phone.fill"
+                        )
+                    }
+                    .disabled(
+                        model.activeVoiceChannel?.id == channel.id
+                            || model.isPrivateCallActionInFlight(in: channel.id)
+                    )
+                    .help(
                         model.privateCall(in: channel.id) == nil
-                            ? "Start Voice Call" : "Join Voice Call",
-                        systemImage: "phone.fill"
+                            ? "Start Voice Call" : "Join Ongoing Call"
+                    )
+
+                    Button {
+                        Task {
+                            if model.privateCall(in: channel.id) != nil {
+                                await model.joinPrivateCall(in: channel, withVideo: true)
+                            } else {
+                                await model.startPrivateCall(in: channel, withVideo: true)
+                            }
+                        }
+                    } label: {
+                        Label("Start Video Call", systemImage: "video.fill")
+                    }
+                    .disabled(
+                        model.activeVoiceChannel?.id == channel.id
+                            || model.isPrivateCallActionInFlight(in: channel.id)
+                    )
+                    .help(
+                        model.privateCall(in: channel.id) == nil
+                        ? "Start Video Call" : "Join Ongoing Call with Video"
                     )
                 }
-                .disabled(
-                    model.activeVoiceChannel?.id == channel.id
-                        || model.isPrivateCallActionInFlight(in: channel.id)
-                )
-                .help(
-                    model.privateCall(in: channel.id) == nil
-                        ? "Start Voice Call" : "Join Ongoing Call"
-                )
-
-                Button {
-                    Task {
-                        if model.privateCall(in: channel.id) != nil {
-                            await model.joinPrivateCall(in: channel, withVideo: true)
-                        } else {
-                            await model.startPrivateCall(in: channel, withVideo: true)
-                        }
+                .highVisibilityPriorityIfAvailable()
+            } else if let channel = selectedVoiceChannel, !model.isVoiceChatOpen {
+                ToolbarItem {
+                    Button { model.openVoiceChat(for: channel) } label: {
+                        Label("Open Chat", systemImage: "bubble.left.fill")
                     }
-                } label: {
-                    Label("Start Video Call", systemImage: "video.fill")
+                    .help("Open voice channel chat")
                 }
-                .disabled(
-                    model.activeVoiceChannel?.id == channel.id
-                        || model.isPrivateCallActionInFlight(in: channel.id)
-                )
-                .help(
-                    model.privateCall(in: channel.id) == nil
-                        ? "Start Video Call" : "Join Ongoing Call with Video"
-                )
-            }
-            .highVisibilityPriorityIfAvailable()
-        } else if let channel = selectedVoiceChannel, !model.isVoiceChatOpen {
-            ToolbarItem {
-                Button { model.openVoiceChat(for: channel) } label: {
-                    Label("Open Chat", systemImage: "bubble.left.fill")
-                }
-                .help("Open voice channel chat")
-            }
-            .highVisibilityPriorityIfAvailable()
-        }
-
-        if !hasOpenSupplementaryConversation, selectedVoiceChannel == nil {
-            if selectedPrivateChannel != nil {
-                ToolbarSpacer(.fixed)
+                .highVisibilityPriorityIfAvailable()
             }
 
-            ToolbarItem {
-                Button { model.showInspector.toggle() } label: {
-                    inspectorToolbarLabel
+            if !hasOpenSupplementaryConversation, selectedVoiceChannel == nil {
+                if selectedPrivateChannel != nil {
+                    ToolbarSpacer(.fixed)
                 }
+
+                ToolbarItem {
+                    Button { model.showInspector.toggle() } label: {
+                        inspectorToolbarLabel
+                    }
+                }
+                .highVisibilityPriorityIfAvailable()
             }
-            .highVisibilityPriorityIfAvailable()
         }
     }
 
@@ -363,7 +565,7 @@ private struct ChatRootView: View {
 
     private var canAcceptWindowDrops: Bool {
         !presentsForumComposer
-            && !showLogin
+            && !showAccountSwitcher
             && model.presentedInteractionModal == nil
             && (model.isComposerDropEligible(.channel)
                 || model.isComposerDropEligible(.thread))
@@ -397,16 +599,38 @@ private struct ChatRootView: View {
         _ urls: [URL],
         to destination: MessageComposerDestination
     ) {
-        guard !urls.isEmpty else { return }
+        let acceptedURLs = model.attachmentURLsWithinDiscordLimit(
+            urls,
+            offeringExternalUploadFor: destination
+        )
+        guard !acceptedURLs.isEmpty else { return }
         Task {
-            let scopedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
+            let scopedURLs = acceptedURLs.filter { $0.startAccessingSecurityScopedResource() }
             defer {
                 for url in scopedURLs {
                     url.stopAccessingSecurityScopedResource()
                 }
             }
             await model.sendAttachmentsImmediately(
-                urls.map { ForumPostAttachment(url: $0) },
+                acceptedURLs.map { ForumPostAttachment(url: $0) },
+                to: destination
+            )
+        }
+    }
+
+    private func sendDroppedPromisedAttachmentsImmediately(
+        _ batch: ComposerPromisedFileBatch,
+        to destination: MessageComposerDestination
+    ) {
+        let acceptedURLs = model.preparePromisedAttachmentsForImmediateSend(
+            batch,
+            to: destination
+        )
+        guard !acceptedURLs.isEmpty else { return }
+        Task {
+            defer { model.endUsingOwnedPromisedFiles(acceptedURLs) }
+            await model.sendAttachmentsImmediately(
+                acceptedURLs.map { ForumPostAttachment(url: $0) },
                 to: destination
             )
         }
@@ -415,7 +639,7 @@ private struct ChatRootView: View {
     private func channelToolbarSymbol(_ channel: Channel) -> String {
         ChannelIconPresentation.systemImage(
             for: channel,
-            isHidden: model.conversationAccess(for: channel) == .hidden,
+            access: model.conversationAccess(for: channel),
             rulesChannelID: selectedGuild?.rulesChannelID
         )
     }
@@ -493,6 +717,74 @@ private struct ChatRootView: View {
     private var selectedGuild: Guild? {
         guard let guildID = model.selectedGuildID else { return nil }
         return model.snapshot?.guilds.first(where: { $0.id == guildID })
+    }
+}
+
+struct DisplayCompleteFrameReporter: NSViewRepresentable {
+    let presentationID: UInt64?
+    let report: @MainActor () -> Void
+
+    func makeNSView(context: Context) -> DisplayCompleteFrameReportingView {
+        DisplayCompleteFrameReportingView(
+            presentationID: presentationID,
+            report: report
+        )
+    }
+
+    func updateNSView(
+        _ nsView: DisplayCompleteFrameReportingView,
+        context: Context
+    ) {
+        nsView.update(
+            presentationID: presentationID,
+            report: report
+        )
+    }
+}
+
+final class DisplayCompleteFrameReportingView: NSView {
+    private var presentationID: UInt64?
+    private var report: @MainActor () -> Void
+    private var didReport = false
+
+    init(
+        presentationID: UInt64?,
+        report: @escaping @MainActor () -> Void
+    ) {
+        self.presentationID = presentationID
+        self.report = report
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard window != nil, !didReport else { return }
+        didReport = true
+        Task { @MainActor [report] in
+            await Task.yield()
+            report()
+        }
+    }
+
+    func update(
+        presentationID: UInt64?,
+        report: @escaping @MainActor () -> Void
+    ) {
+        self.report = report
+        guard self.presentationID != presentationID else { return }
+        self.presentationID = presentationID
+        didReport = false
+        needsDisplay = true
     }
 }
 

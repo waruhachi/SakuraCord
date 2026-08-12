@@ -8,22 +8,32 @@ public struct DiscordProductionBaseline: Codable, Equatable, Sendable {
     public var apiVersion: Int
     public var desktopVersion: String
     public var electronVersion: String
+    public var chromiumVersion: String
+    public var nativeBuildNumber: Int
+    public var apexAppSurface: Int
     public var webGatewayEncoding: String
     public var webGatewayCompression: String
     public var desktopGatewayEncoding: String
     public var desktopGatewayCompression: String
     public var defaultCapabilities: Int
+    public var privateChannelObfuscationCapabilities: Int
+    public var qosHeartbeatVersion: Int
 
-    public static let july2026 = DiscordProductionBaseline(
-        observedAt: Date(timeIntervalSince1970: 1_784_240_478),
-        webBuildNumber: 579_073,
+    public static let august2026 = DiscordProductionBaseline(
+        observedAt: Date(timeIntervalSince1970: 1_785_773_429),
+        webBuildNumber: 587_597,
         apiVersion: 9,
-        desktopVersion: "0.0.401",
-        electronVersion: "37.6.0",
+        desktopVersion: "0.0.403",
+        electronVersion: "42.7.1",
+        chromiumVersion: "148.0.7778.280",
+        nativeBuildNumber: 87_263,
+        apexAppSurface: 2,
         webGatewayEncoding: "json",
         webGatewayCompression: "zlib-stream",
         desktopGatewayEncoding: "etf",
         desktopGatewayCompression: "zstd-stream",
-        defaultCapabilities: 1_734_653
+        defaultCapabilities: 1_734_653,
+        privateChannelObfuscationCapabilities: 1_767_421,
+        qosHeartbeatVersion: 29
     )
 }

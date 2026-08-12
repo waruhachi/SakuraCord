@@ -20,6 +20,21 @@ struct ChatDetailView: View {
                         roles: model.guildRoles
                     )
                 )
+                .background {
+                    DisplayCompleteFrameReporter(
+                        presentationID: channel.id.rawValue
+                    ) {
+                        guard model.selectedChannelID == channel.id else {
+                            return
+                        }
+                        AppPerformanceSignposts
+                            .reportNonTimelineWorkspaceFrame()
+                        AppPerformanceSignposts.reportConversationFirstFrame(
+                            channelID: channel.id
+                        )
+                    }
+                    .frame(width: 1, height: 1)
+                }
             } else {
                 MessageTimelineView(
                     model: model,

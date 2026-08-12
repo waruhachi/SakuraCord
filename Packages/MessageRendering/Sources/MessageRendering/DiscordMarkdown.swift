@@ -536,35 +536,29 @@ public enum DiscordMarkdown {
                 continue
             }
 
-            if source[cursor] == "[",
-               let labelEnd = source[cursor...].firstIndex(of: "]")
+            if let link = markdownLink(
+                in: source,
+                at: cursor,
+                inheritedTraits: inheritedTraits
+            )
             {
-                let openingParenthesis = source.index(after: labelEnd)
-                if openingParenthesis < source.endIndex,
-                   source[openingParenthesis] == "(",
-                   let closingParenthesis = source[openingParenthesis...]
-                    .firstIndex(of: ")"),
-                   let url = MessageLinkPolicy.allowedURL(
-                       from: String(
-                           source[
-                               source.index(after: openingParenthesis)
-                                   ..< closingParenthesis
-                           ]
-                       )
-                   )
-                {
-                    flushPlain()
-                    let labelStart = source.index(after: cursor)
-                    result.append(
-                        contentsOf: inlineRuns(
-                            source[labelStart ..< labelEnd],
-                            inheritedTraits: inheritedTraits,
-                            inheritedLink: url
-                        )
-                    )
-                    cursor = source.index(after: closingParenthesis)
-                    continue
-                }
+                flushPlain()
+                result.append(contentsOf: link.runs)
+                cursor = link.endIndex
+                continue
+            }
+
+            if inheritedLink == nil,
+               let autolink = bareAutolink(
+                   in: source,
+                   at: cursor,
+                   traits: inheritedTraits
+               )
+            {
+                flushPlain()
+                result.append(autolink.run)
+                cursor = autolink.endIndex
+                continue
             }
 
             if let match = delimitedRuns(
@@ -610,6 +604,58 @@ public enum DiscordMarkdown {
                 color: nil
             ),
             source.index(after: close)
+        )
+    }
+
+    private static func markdownLink(
+        in source: Substring,
+        at cursor: String.Index,
+        inheritedTraits: AppKitPlan.InlineTraits
+    ) -> (runs: [AppKitPlan.InlineRun], endIndex: String.Index)? {
+        guard source[cursor] == "[",
+              let labelEnd = source[cursor...].firstIndex(of: "]")
+        else { return nil }
+        let openingParenthesis = source.index(after: labelEnd)
+        guard openingParenthesis < source.endIndex,
+              source[openingParenthesis] == "(",
+              let closingParenthesis = source[openingParenthesis...]
+                .firstIndex(of: ")"),
+              let url = MessageLinkPolicy.allowedURL(
+                  from: String(
+                      source[
+                          source.index(after: openingParenthesis)
+                              ..< closingParenthesis
+                      ]
+                  )
+              )
+        else { return nil }
+        return (
+            inlineRuns(
+                source[source.index(after: cursor) ..< labelEnd],
+                inheritedTraits: inheritedTraits,
+                inheritedLink: url
+            ),
+            source.index(after: closingParenthesis)
+        )
+    }
+
+    private static func bareAutolink(
+        in source: Substring,
+        at cursor: String.Index,
+        traits: AppKitPlan.InlineTraits
+    ) -> (run: AppKitPlan.InlineRun, endIndex: String.Index)? {
+        guard let match = firstURL(in: source[cursor...]),
+              match.range.lowerBound == cursor
+        else { return nil }
+
+        return (
+            AppKitPlan.InlineRun(
+                text: String(source[match.range]),
+                traits: traits,
+                link: match.url,
+                color: nil
+            ),
+            match.range.upperBound
         )
     }
 
@@ -706,14 +752,29 @@ public enum DiscordMarkdown {
             $0.lowerBound < $1.lowerBound
         }) else { return nil }
         var end = prefix.upperBound
-        while end < source.endIndex,
-              !source[end].isWhitespace,
-              !")]>".contains(source[end])
-        {
+        var parenthesisDepth = 0
+        scan: while end < source.endIndex {
+            let character = source[end]
+            if character.isWhitespace || "]<>".contains(character) {
+                break
+            }
+            if character == ")" {
+                guard parenthesisDepth > 0 else { break scan }
+                parenthesisDepth -= 1
+            } else if character == "(" {
+                parenthesisDepth += 1
+            }
             end = source.index(after: end)
         }
+        while end > prefix.upperBound {
+            let previous = source.index(before: end)
+            guard ".,!?;:".contains(source[previous]) else { break }
+            end = previous
+        }
         let range = prefix.lowerBound ..< end
-        guard let url = URL(string: String(source[range])) else {
+        guard let url = MessageLinkPolicy.allowedURL(
+            from: String(source[range])
+        ) else {
             return nil
         }
         return (range, url)

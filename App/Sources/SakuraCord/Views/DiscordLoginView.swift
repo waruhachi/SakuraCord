@@ -20,9 +20,9 @@ struct DiscordLoginView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let showsCancel: Bool
     let networkingEnabled: Bool
-    let onConnected: @MainActor (CredentialHandle) async -> String?
+    let onConnected: @MainActor (PendingDiscordCredential) async -> String?
 
-    @State private var authenticator = DiscordSessionAuthenticator()
+    @State private var authenticator: DiscordSessionAuthenticator
     @State private var remoteAuthManager = DiscordRemoteAuthManager()
     @State private var identifier = ""
     @State private var password = ""
@@ -44,6 +44,17 @@ struct DiscordLoginView: View {
     @State private var backgroundAnimationStart = Date()
     @FocusState private var focusedField: DiscordLoginField?
 
+    init(
+        showsCancel: Bool,
+        networkingEnabled: Bool,
+        onConnected: @escaping @MainActor (PendingDiscordCredential) async -> String?
+    ) {
+        self.showsCancel = showsCancel
+        self.networkingEnabled = networkingEnabled
+        self.onConnected = onConnected
+        _authenticator = State(initialValue: DiscordSessionAuthenticator())
+    }
+
     var body: some View {
         ZStack {
             GeometryReader { geometry in
@@ -60,7 +71,7 @@ struct DiscordLoginView: View {
 
             GeometryReader { geometry in
                 ScrollView {
-                    DiscordLoginCard {
+                    SakuraCordAuthenticationCard {
                         if let challenge {
                             VStack(alignment: .leading, spacing: 18) {
                                 DiscordLoginHeader()
@@ -121,15 +132,7 @@ struct DiscordLoginView: View {
             windowDragRegion
 
             if showsCancel {
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.body.weight(.semibold))
-                        .frame(width: 32, height: 32)
-                        .background(.white.opacity(0.08), in: Circle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white.opacity(0.72))
-                .keyboardShortcut(.cancelAction)
+                SakuraCordAuthenticationCloseButton { dismiss() }
                 .padding(20)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
             }
@@ -271,8 +274,8 @@ struct DiscordLoginView: View {
 
     private func handle(_ step: DiscordNativeAuthenticationStep) async {
         switch step {
-        case let .authenticated(handle):
-            await finishConnection(handle)
+        case let .authenticated(credential):
+            await finishConnection(credential)
         case let .mfa(value):
             challenge = value
             selectedMFAMethod = value.methods.first
@@ -294,12 +297,12 @@ struct DiscordLoginView: View {
         authenticationTask = Task {
             defer { isWorking = false }
             do {
-                let handle = try await authenticator.completeMFA(
+                let credential = try await authenticator.completeMFA(
                     challenge: challenge,
                     method: selectedMFAMethod,
                     code: submittedCode
                 )
-                await finishConnection(handle)
+                await finishConnection(credential)
             } catch is CancellationError {
                 return
             } catch {
@@ -331,9 +334,9 @@ struct DiscordLoginView: View {
         }
     }
 
-    private func finishConnection(_ handle: CredentialHandle) async {
+    private func finishConnection(_ credential: PendingDiscordCredential) async {
         isHandingOffCredential = true
-        if let bootstrapError = await onConnected(handle) {
+        if let bootstrapError = await onConnected(credential) {
             isHandingOffCredential = false
             errorTitle = "Account bootstrap stopped"
             errorMessage = bootstrapError
@@ -421,9 +424,9 @@ struct DiscordLoginView: View {
 
     private func finishRemoteAuth(encryptedToken: String) async throws {
         let token = try await remoteAuthManager.decryptToken(encryptedToken)
-        let handle = try await authenticator.acceptRemoteAuthToken(token)
+        let credential = try await authenticator.acceptRemoteAuthToken(token)
         await remoteAuthManager.disconnect()
-        await finishConnection(handle)
+        await finishConnection(credential)
     }
 }
 
@@ -440,7 +443,7 @@ private struct DiscordLoginHeader: View {
     }
 }
 
-private struct DiscordLoginCard<Content: View>: View {
+struct SakuraCordAuthenticationCard<Content: View>: View {
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -466,6 +469,47 @@ private struct DiscordLoginCard<Content: View>: View {
                     )
             }
             .shadow(color: Color(hex: 0x07040A).opacity(0.58), radius: 30, y: 18)
+    }
+}
+
+struct SakuraCordAuthenticationCloseButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.body.weight(.semibold))
+                .frame(width: 32, height: 32)
+                .background(.white.opacity(0.08), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.72))
+        .keyboardShortcut(.cancelAction)
+    }
+}
+
+struct SakuraCordAuthPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.body.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
+            .contentShape(Rectangle())
+            .foregroundStyle(.white)
+            .background(
+                LinearGradient(
+                    colors: [Color(hex: 0xFF659F), Color(hex: 0xE84778)],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                ),
+                in: ConcentricRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .shadow(
+                color: Color(hex: 0xE84778).opacity(0.28),
+                radius: 12,
+                y: 6
+            )
+            .opacity(configuration.isPressed ? 0.82 : 1)
     }
 }
 
@@ -506,22 +550,8 @@ private struct DiscordCredentialForm: View {
             }
             Button(action: submit) {
                 Text(isWorking ? "Signing in…" : "Sign in")
-                    .font(.body.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 44)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .background(
-                LinearGradient(
-                    colors: [Color(hex: 0xFF659F), Color(hex: 0xE84778)],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                ),
-                in: ConcentricRectangle(cornerRadius: 10, style: .continuous)
-            )
-            .shadow(color: Color(hex: 0xE84778).opacity(0.28), radius: 12, y: 6)
+            .buttonStyle(SakuraCordAuthPrimaryButtonStyle())
             .opacity(identifier.isEmpty || password.count < 8 || isWorking ? 0.45 : 1)
             .disabled(identifier.isEmpty || password.count < 8 || isWorking)
         }

@@ -1,6 +1,7 @@
 # Discord production protocol baseline
 
-Last repository audit: 25 July 2026 at SakuraCord commit `32a6b8e`.
+Last repository audit: 7 August 2026, in a working tree based on SakuraCord
+commit `5a2f42d`.
 
 This document describes SakuraCord's durable network contract and the dated
 evidence behind it. It is not a claim that Discord's undocumented
@@ -13,14 +14,17 @@ request, or commit description rather than a new Markdown file.
 
 ## Evidence snapshot
 
-The most recent repository-wide comparison was performed on 22–23 July 2026
+The most recent repository-wide comparison was performed on 3 August 2026
 using:
 
-- Discord's public production web build `580156`, version hash
-  `af6069991f1b0f884f278271a1fe36a2432d056c`, API version 9;
-- a signed and notarized stable desktop host `0.0.401`; authenticated
-  observations from a renderer with Equicord injection were limited to visible
-  behavior or separately sanitized request semantics;
+- Discord's public production web build `587597`, version hash
+  `1a0e2d017c39d427ced2a95c829fd32621bddb14`, API version 9, and main asset
+  `web.a8c0f0f55a5a68c4.js` with SHA-256
+  `32ea3730be90665e54ee0126c63b1b85a01000f5ab57f92618cf26bd725bc490`;
+- an unmodified, signed, and notarized stable desktop host `0.0.403`
+  (Electron `42.7.1`, Chromium `148.0.7778.280`, native updater build
+  `87263`) installed by Discord's current official distribution into an
+  isolated temporary profile so the installed Equicord app was not targeted;
 - Paicord revision `694761c1938b73bb60bd58942674dfe73aab1135`;
 - Swiftcord v1 revision `14465d927ebe1ba34b3befa00f9365fad7b56eb9`
   and DiscordKit revision `2d42c69cafe592300a1a9d3a307bf485294026c7`;
@@ -37,6 +41,214 @@ No token, cookie, authorization header, message body, personal payload,
 fingerprint, installation identifier, or unsanitized traffic is stored in this
 repository. Treat every build number and observed payload as a dated snapshot,
 not current official behavior.
+
+The GIF-picker surface was re-audited on 6 August 2026 against clean, signed,
+notarized Discord desktop `0.0.406` and production asset
+`web.b96889ed56c413ab.js` (SHA-256
+`1990d86f35f4e4071ff499fcd0f18c04b44a27fdbfafd61b80011c67c10b1654`).
+The clean host used the existing authenticated Discord profile while the
+installed modified Discord/Equicord bundle remained untouched. Sanitized CDP
+observation covered opening the picker, opening trending and favourites,
+searching for `hello`, and one add-then-remove favourite restoration. No GIF
+was sent and no content, credential, cookie, or authorization value was
+retained. Paicord has a placeholder picker and the matching generated
+favourites protobuf schema but no GIF HTTP implementation. Swiftcord v1 has no
+corresponding GIF picker, search, or favourites path.
+
+The native GIF media follow-up was rechecked on 7 August 2026 against that same
+first-party asset (the fetched asset still matched the recorded SHA-256). Its
+picker result normalizer consumes the response-provided `src` and `gif_src`
+media URLs; the selected format for these routes is WebM. A sanitized current
+SakuraCord response confirmed that Discord search and landing results now use
+`static.klipy.com` WebM and WebP media. The first-party picker assigns those
+response URLs directly to its image and video elements without applying
+Discord's separate `isAllowedGifProviderUrl` asset-action helper. Discord's current
+public developer-documentation index, API reference, and message resource do
+not document the normal-user GIF-picker routes or its media providers.
+Klipy's current [API documentation](https://docs.klipy.com/getting-started)
+and Google's current [Tenor response documentation](https://developers.google.com/tenor/guides/response-objects-and-errors)
+confirm that media responses contain separate format-specific URLs. The pinned Paicord
+revision still has only its placeholder picker and generated favourites
+schema, with no GIF media fetch. The pinned Swiftcord v1 and DiscordKit
+revisions still have no GIF picker or media path. Those absences provide no
+alternative origin, header, retry, or fallback behavior to copy.
+
+The native sign-in preflight was re-audited on 7 August 2026 against production
+asset `web.3cd0f98a15f63be2.js` (SHA-256
+`a77974b18a92b7d5452d4138b0b276f380ac498fd7fefa1b9aa7e183ace0f4f0`).
+The first-party Apex action requests the integer `APP` surface, accepts an
+optional returned installation, and records a fetch failure without blocking
+the independent authentication-store `/experiments` request. That request
+accepts both `fingerprint` and `installation`. Sanitized unauthenticated checks
+confirmed that `surface=2` and an installation-free
+`with_guild_experiments=true` request each returned a nonempty server-issued
+installation; the latter also returned a nonempty fingerprint. Public Discord
+documentation has no corresponding normal-user authentication endpoints.
+Pinned Paicord performs only its fingerprint `/experiments` request and has no
+Apex path. Pinned Swiftcord v1 delegates sign-in to Discord's embedded web
+flow. No credential, authenticated login, or personal response value was used
+or retained for this re-audit.
+
+The post-approval installation repair was re-audited on 8 August 2026 after two
+sanitized SakuraCord QR-login traces showed successful Apex responses that
+contained assignments but no installation; the second trace also showed the
+fallback `/experiments` response returning a fingerprint and assignments but no
+installation. The current production asset
+`web.6d63a33a2f3badf3.js` (SHA-256
+`da550764957c0a3974bf3ac5fd72816075aa13c67b9443f784471bd6158ce6b9`)
+still treats both response installations as optional and conditionally adds
+`installation_id` to Gateway Identify only when one is available. Discord's
+public Gateway documentation requires only `os`, `browser`, and `device` as
+connection properties and has no corresponding normal-user authentication
+routes. Pinned Paicord performs only its installation-free fingerprint
+`/experiments` request and its Gateway Identify has no installation field;
+pinned Swiftcord v1 delegates sign-in to Discord's embedded web flow and starts
+Gateway without managing an installation. The repair therefore makes the two
+lookups best-effort and proceeds without the optional field when both omit it;
+it retains a returned installation when present and never replays authentication.
+No credential, challenge solution, or personal response value was retained.
+
+Message forwarding and its destination picker were re-audited on 9 August
+2026 against clean, renamed Discord desktop `0.0.406` (Electron `42.7.1`,
+Chromium `148`) and production asset `web.6d63a33a2f3badf3.js` (SHA-256
+`da550764957c0a3974bf3ac5fd72816075aa13c67b9443f784471bd6158ce6b9`). The
+first-party action sends one ordinary message mutation per selected destination
+with empty wrapper content, a nonce but no `enforce_nonce`, `tts:false`,
+`flags:0`, `message_reference.type = 1`, source message/channel/guild IDs, and
+`X-Context-Properties` location `forwarding`. Multiple destination mutations
+start together and are settled independently. If the user also enters context,
+the client sends it as one subsequent ordinary message per destination only
+after that destination's forward succeeds; it omits the context send when
+slowmode applies and the user lacks the bypass permission. A missing direct
+message is resolved first with one coalesced `POST /users/@me/channels` carrying
+the single recipient. The picker caps explicit selection at five.
+
+The source eligibility guard accepts only message types `0`, `19`, `20`, `23`,
+and `35`. It rejects failed local sends, polls, shared client themes, activities,
+calls, activity instances, forwarding-disabled sources, gated channels or
+threads, sources without read-message-history permission, and any flag outside
+the first-party allowlist (`1`, `2`, `4`, `16`, `32`, `256`, `512`, `1024`,
+`4096`, `8192`, `16384`, `32768`, and `524288`). Destination validation also
+checks send permission plus attachment, embed-link, external-sticker, and voice-
+message permissions required by the immutable snapshot.
+
+Sanitized CDP captures showed that opening, scrolling, and typing in the picker
+perform no destination REST request or Gateway search; search is local over the
+account-wide channel store, active joined threads, known users, and direct
+messages. `READY_SUPPLEMENTAL.users` extends that known-user set without a REST
+lookup, and relationship nicknames plus legacy discriminators remain available
+to the user-search worker. Discord's joined-thread store is distinct from its
+forum catalogue: `CONNECTION_OPEN` admits active thread records only when their
+embedded `member` is present, while thread-list and member events update or
+remove that membership without a forum-page replacement erasing it. Blank
+results concatenate picker-local destinations
+selected from a typed search, the remove-and-unshift channel history capped at
+eight and persisted by the client-local `QuickSwitcherStore`, and computed
+frequent destinations. A client relaunch therefore preserves this history;
+each `CHANNEL_SELECT` removes the selected channel if already present, prepends
+it, and truncates the stored list to eight. The three sources then
+deduplicate, omit the source
+unless search-selected, and cap the final list at 15. Selecting a destination
+already visible in the blank list does not move it or create a picker-local
+pin. Selecting a typed-search result clears the query and prepends that result,
+followed by the picker's other currently selected destinations in their
+existing selection order, for the lifetime of the open picker; the searched
+result remains pinned even if it is later deselected.
+
+Typed search separately caps raw user, group-DM, text/thread, and voice
+categories at 20 before the Forward-specific destination filter runs and then
+combines the survivors by the first-party match and frecency score. A sanitized
+10 August follow-up inspected the live query helpers and confirmed that denied
+voice rows can consume raw category slots without lower eligible matches being
+backfilled; forum and media rows behave equivalently in the raw text category.
+The account-wide user index is updated from Ready, Ready Supplemental,
+`GUILD_CREATE`, batched member chunks, individual member changes, relationship
+and private-channel changes, forum/thread loads, and authors and mentions in
+successful message-history or live-message events; these are cache updates and
+add no picker request. The manager does not subscribe to
+`GUILD_MEMBER_LIST_UPDATE`, so ordinary virtualized member-list range updates
+must not add Forward user candidates. The
+10 August follow-up also inspected production asset
+`web.2548ec5eac0614b5.js` (SHA-256
+`514e91b189b59604adb5d008008b20f9c0f72aec9deb7915989c5f6da5506216`)
+and its user-search worker `16844172e1c61d95.js` (SHA-256
+`42090c7222926792067af81023aefe1ec5fd1e26c1a2b2276f34513e4bc59fcd`).
+Its user and guild-member stores process `LOCAL_MESSAGES_LOADED` before
+`CONNECTION_OPEN`, so identities and guild nicknames recovered from local
+message pages seed insertion order before Ready users and members; subsequent
+history and live-message discoveries append without moving existing entries.
+SakuraCord mirrors that state source with an account-scoped cache containing
+only message-observed user identity records and nonempty guild nicknames from
+the current resolved member store. Ephemeral guild, member-chunk, relationship,
+and private-channel updates feed the live index without being written into the
+message-derived cache. Like Discord's GuildMemberStore, it does not
+index the historical `message.member` nickname embedded in a message. It
+does not retain message bodies for Forward search, and loading or updating this
+cache performs no Discord request. The
+global channel query requires each vocal destination's full first-party
+`accessPermissions`, including `VIEW_CHANNEL` and `CONNECT`; non-vocal guild
+destinations require `VIEW_CHANNEL` at this raw-search stage. The later Forward
+filter rejects forum/media destinations and requires `VIEW_CHANNEL` plus
+`SEND_MESSAGES` for guild text, thread, and voice survivors. The
+matcher assigns exact, prefix, containment, all-term, then ordered-subsequence
+scores for channel and Group-DM records. User results come from Discord's
+account-wide user-search worker. Its identity order is username, relationship
+nickname, global name, then guild nicknames in store order; prefix, containment,
+and ordered-subsequence matches score `10`, `5`, and `1`. The subsequence check
+runs over both accent-folded text and the worker's Unicode-confusable skeleton.
+The current skeleton uses compatibility-equivalent styled letters and includes
+the ASCII transformations `0 → o`, `1/I → l`, and `m → rn`. The first identity
+with the highest score becomes the comparator. The picker uses the first-party
+unified comparator: it sorts by score, then sorts equal-score user rows by that
+lowercased comparator using JavaScript UTF-16 code-unit order. Channel and
+Group-DM results provide `sortable`; the current first-party comparator reads
+the left result's `sortable` for both operands, so those equal-score rows
+preserve the candidate store's order. The global channel candidate order is
+the `ChannelStore` insertion sequence: `CONNECTION_OPEN` visits guild records
+in their Gateway order and inserts each full-sync channel item in payload
+order; `loadAllGuildAndPrivateChannelsFromDisk()` then exposes guild channels
+in that raw order before private channels. This is intentionally independent
+of the category/position ordering used by the channel sidebar. SakuraCord
+therefore retains a separate raw channel-ID sequence for Forward search rather
+than reusing its presentation-sorted channel array. The
+separate category/channel-position comparator in the same bundle belongs to
+application-command channel arguments and is not used by the Forward picker.
+The final merge preserves category concatenation order when scores tie. Named Group DMs show recipient display
+names as detail, while an unnamed Group DM with an empty raw name has no detail.
+The guild/channel frecency store retains at most ten samples, overrides the
+generic engine's weight function with `0/1/2–3/4–6/>=7` day weights of
+`100/70/50/30/10`, and computes
+`ceil(totalUses * recencyWeight / samples)`;
+persisted computed score fields are discarded and entries without a retained
+sample are omitted. The channel matcher adds up to three points before its
+match-class cap using the live Forward path's `100`-point bonus scale; the category
+booster separately multiplies by `1 + score / maximumResolvedScore`. Like the
+first-party persisted store, locally pending channel and guild selections
+survive a relaunch; SakuraCord stores an account-scoped aggregate containing
+the pending total-use delta and newest ten timestamps, then replays it over the
+fresh settings snapshot without an extra request. Controlled
+fresh-launch comparisons reproduced the same
+navigation sequence before comparing blank search, multiple queries, and deep
+scroll results. Live forwarding used a controlled test message; only sanitized
+request shape and counts were retained, never credentials, authorization
+metadata, message content, or personal identifiers.
+
+Pinned Paicord has snapshot decoding/rendering and a placeholder Forward action,
+but no forwarding request or destination-picker implementation. Pinned
+Swiftcord v1 has neither forwarding nor snapshot support. DiscordKit at the
+repository pin has no forwarding implementation; its later `73c0996` DTO-only
+addition remains a decoding cross-check rather than picker, request, or ordering
+evidence.
+
+The clean desktop observation covered sign-in restoration, Gateway startup,
+opening a public guild and its default channel, history loading, and a renderer
+reload. Selecting the guild caused one newest-history GET and no read
+acknowledgement. The reload rebuilt account and guild state from Gateway rather
+than issuing `/users/@me` or `/users/@me/guilds`; it also performed the
+first-party lurker-membership mutation for that public guild. SakuraCord does
+not copy unrelated store, billing, analytics, experiment, or lurker-join
+fan-out. No message, reaction, acknowledgement, call, or other user-content
+mutation was sent during the observation.
 
 ### Evidence priority for protocol changes
 
@@ -74,7 +286,8 @@ request-contract and request-budget tests.
 | Slash commands | Enabled | Enabled |
 | Message components and returned modals | Disabled | Enabled with fixtures |
 | Remote component choices | Disabled | Enabled with local fixtures |
-| GIF search | Disabled | Enabled with fixtures |
+| GIF picker, search, favourites, and sending | Enabled | Enabled with fixtures |
+| Message forwarding and forwarded snapshot rendering | Enabled | Enabled with fixtures |
 | Guild sticker catalog and sticker sending | Disabled | Enabled with fixtures |
 
 Rendering decoded embeds, Components V2, stickers, attachments, and interaction
@@ -97,6 +310,157 @@ Every authenticated request goes through `DiscordRESTProvider.perform`:
   remote-auth Gateway envelopes; and
 - one provider-wide safety circuit shared with the Gateway session.
 
+Normal cold startup is Gateway-first. `READY.user`, `READY.guilds`,
+`READY.private_channels`, settings, read state, and the supplemental payload
+seed the account before the first snapshot is published. A complete Ready
+therefore sends zero `/users/@me` and zero `/users/@me/guilds` reads. In the
+sanitized 4 August 2026 large-account desktop observation, Ready carried all 16
+guild IDs and their channel collections but omitted the guild names needed for
+the catalogue. SakuraCord used one bounded `/users/@me/guilds` fallback after a
+server `429`; the decoded settings contained 12 folders covering 15 guilds.
+That layout must remain pending until the fallback catalogue is installed, then
+order the live rail instead of being consumed against an empty catalogue. The
+two REST routes remain sequential, bounded compatibility fallbacks when Ready
+omits required data, except that `/users/@me` is available only to a previously
+stored session. A newly authenticated session requires `READY.user` before it
+persists the credential and never falls back to that route. This matches the
+current official login and Swiftcord v1's pending-token flow. Paicord's stores
+are Gateway-owned after connection, but its login view model is the documented
+outlier that reads `/users/@me` before storing an account. Paicord also treats
+the Ready settings proto as the authoritative guild-folder order.
+
+The current first-party web asset defines the Apex experiment surface
+`APP` as integer `2` and sends that value on the current login path. A sanitized
+unauthenticated production check returned `400` / Discord error `50035` for the
+obsolete string `discord_app`, while `surface=2` returned `200` with the
+expected installation field. The first-party action does not make that fetch a
+prerequisite for its independent `/experiments` path, which also accepts a
+returned installation. Discord's public API documentation, pinned Paicord, and
+pinned Swiftcord v1 have no corresponding Apex implementation.
+
+### Audited HTTP route surface
+
+This is the complete production Discord HTTP surface reachable from the
+current app. Optional keys are omitted from JSON rather than encoded as null
+unless the row says otherwise. `P−` and `S−` mean the pinned Paicord or
+Swiftcord v1 revision has no corresponding implementation; absence was checked
+and retained as evidence.
+
+| Method and route template | Trigger and exact supported request shape | Cross-reference result |
+| --- | --- | --- |
+| `GET /apex/experiments?surface=2` | Primary cold native password/MFA installation preflight, or the first best-effort request in a pending-QR/stored-session repair when the credential lacks its installation identity; unauthenticated, no body, Authorization, fingerprint, installation header, or heartbeat session. Only a returned installation ID is retained. If the request fails or omits it, `/experiments` follows. The obsolete string surface is rejected with `400` / `50035`. | Current official login treats Apex failure and an omitted installation as non-blocking before its independent authentication-store preflight; P−, S−. |
+| `GET /experiments?with_guild_experiments=true` | Cold native password/MFA fingerprint preflight, or one pending-QR/stored-session installation fallback after Apex fails or omits the identity; unauthenticated, no body, and `X-Context-Properties` location `Login`. It carries the Apex-issued installation when available. Password login requires only the returned fingerprint; all paths retain a nonempty installation when present and otherwise omit it from REST and Gateway metadata. | Current official login accepts both response fields independently and conditionally adds installation to Gateway Identify; Paicord supplies the installation-free fingerprint and Gateway cross-check; Swiftcord v1 has no native-login counterpart and starts Gateway without managing installation. Paicord lacks the current query/context shape. |
+| `POST /auth/login` | Explicit login; `login`, `password`, `undelete:false`, `login_source:null`, and `gift_code_sku_id:null`; one user-completed CAPTCHA replay may add challenge headers. | Current official live password login and web action; Paicord omits the null keys; S−. |
+| `POST /auth/mfa/{totp,sms,backup}` | Explicit MFA; `code`, `ticket`, optional `login_instance_id`, `login_source:null`, and `gift_code_sku_id:null`. | Current official web action and Paicord; no live MFA challenge occurred in the 3 August clean-client pass; S−. |
+| `POST /auth/mfa/sms/send` | Explicit SMS choice; `ticket`. | Current official and Paicord; S−. |
+| `POST /users/@me/remote-auth/login` | Approved QR ticket exchange; `ticket`; at most one user-completed CAPTCHA replay. | Current official remote-auth v2 and Paicord; S−. |
+| `GET /users/@me` | Incomplete-Ready compatibility fallback for a previously stored session only; no body. A newly authenticated session fails closed if Ready omits its user and never sends this route. | Public user semantics and Paicord. Current official login and Swiftcord v1 obtain the authenticated user from Gateway Ready; Paicord login performs this extra read. |
+| `GET /users/@me/guilds` | Incomplete-Ready compatibility fallback only; no body. | Public guild semantics; normal current official/Paicord/Swiftcord startup uses Gateway instead. |
+| `GET /guilds/{guild}/channels` | Cache-miss fallback only; no body, coalesced by guild. | Public channel semantics and all three client references. |
+| `GET /guilds/{guild}/roles` | Visible role/member UI cache miss; no body, coalesced. | Public guild semantics and all three client references. |
+| `GET /guilds/{guild}/roles/{role}/member-ids` | Explicit role inspection; no body; result display capped at 1,000. | Current first-party route; P−, S−. |
+| `GET /users/{user}/profile` | Explicit profile; `with_mutual_guilds=true`, `with_mutual_friends=true`, `with_mutual_friends_count=true`, plus `guild_id` only in guild context; coalesced by user and guild context. A `404` for an unavailable user remains scoped to the profile presentation and does not stop the session. | Current first-party and Paicord; Swiftcord has historical profile data but no equivalent complete route. |
+| `GET /collectibles-products/{product}` | At most one cache-miss read for a profile effect returned by the profile response; query contains the current `locale`. | Current first-party route; P−, S−. The obsolete `/user-profile-effects` fallback was removed. |
+| `GET /guilds/{guild}/emojis` | Stale/missing Gateway and disk-cache fallback; no body, coalesced. | Public emoji semantics and all three client references. |
+| `GET /users/@me/settings-proto/2` | Explicit emoji- or GIF-favourites-settings cache miss; no body, coalesced for the provider session. | Current first-party and Paicord's generated Frecency settings schema; Swiftcord has the versioned settings-proto path but no GIF picker. |
+| `PATCH /users/@me/settings-proto/2` | One explicit GIF favourite add or remove; JSON contains only `settings`, whose value is the complete updated base64 Frecency proto. The favourite map key is the canonical GIF URL. Its value contains format (`IMAGE = 1`, `VIDEO = 2`), source URL, width, height, and monotonically increasing order; display order is descending order. The declared format is preserved on reads, including for extensionless CDN sources. Unrelated and unknown top-level proto fields are preserved. | Current first-party action and generated Paicord schema; Swiftcord v1 has no GIF favourite mutation. |
+| `GET /gifs/trending?locale={locale}&media_format=webm` | Opening the GIF picker; one cacheable landing read returning the current base categories in server order and their preview media. | Current first-party route and clean-client request; P−, S−. |
+| `GET /gifs/trending-gifs?media_format=webm&locale={locale}` | Explicit Trending GIFs selection; no body. The returned order is preserved. | Current first-party route and clean-client request; P−, S−. |
+| `GET /gifs/search?q={query}&media_format=webm&locale={locale}` | Nonempty picker search after the current 250 ms debounce; no speculative or paginated follow-up. The live default response is 50 results and its order is preserved. | Current first-party route/action and clean-client `hello` request; P−, S−. |
+| `GET /channels/{channel}/messages` | Visible history only; guild history requires effective `VIEW_CHANNEL` and `READ_MESSAGE_HISTORY`, and voice-channel history additionally requires `CONNECT`. The current clean client uses `limit=10` for a newly selected uncached channel, which SakuraCord matches once per channel per uninterrupted Gateway connection. A dispatched newest-page read is allowed to finish and populate the session stores after a later selection supersedes its presentation; rapid navigation does not abort those reads. Reopening a loaded channel restores its bounded session-memory page and sends no history request. After a Gateway gap, the retained page is presented immediately but its completeness marker is invalidated; returning to Ready refreshes the selected page once and later reopened pages refresh once on selection. Older-page pagination uses ordered `before` then `limit=50`; no body. | Public message semantics, current first-party permission/message paths and stale-connection refresh, and Paicord's permission-checked channel store. Swiftcord v1 checks `VIEW_CHANNEL` before presentation but otherwise supplies only a historical unguarded/refetching history path. Paicord retains a per-channel in-memory store and uses a historical 50-message initial page. The current first-party cache behavior and connection-generation invalidation take precedence. |
+| `GET /channels/{thread}` | One unknown-thread deep-link resolution; no body. | Public channel semantics and all three references. |
+| `POST /channels/{forum}/threads?use_nested_fields=true` | Explicit forum creation; `name`, `auto_archive_duration`, ordered `applied_tags`, nested `message` with `content`, `sticker_ids:[]`, and attachments only when uploaded. | Current first-party action; Paicord and Swiftcord have only partial/historical thread creation. |
+| `GET /channels/{forum}/threads/search` | Forum catalogue: `archived=true`, `sort_by`, `sort_order=desc`, `limit`, `offset`, and optional `tag`/`tag_setting`; name search adds `name`. | Current first-party route; P−, S−. |
+| `POST /channels/{forum}/post-data` | Preview hydration with `thread_ids` batches of at most ten. | Current first-party route; P−, S−. |
+| `PATCH` or `DELETE /channels/{thread}` | One explicit forum metadata mutation or deletion; partial body for the selected action only. | Current first-party and public channel semantics; partial Paicord/Swiftcord coverage. |
+| `POST /channels/{thread}/thread-members/@me?location=Change%20Notification%20Settings` | One join only when changing settings for an unjoined post; empty body. | Current first-party route; P−, S−. |
+| `PATCH /channels/{thread}/thread-members/@me/settings` | Explicit thread notification change; only reviewed `flags`, `muted`, and `mute_config` keys. | Current first-party route; P−, S−. |
+| `POST /channels/{channel}/typing` | Empty body after the local 1.5-second delay and eight-second coalescing window. | Public typing semantics and all three references. |
+| `POST /channels/{channel}/messages/{message}/ack` | One viewport-qualified acknowledgement; `token` is always present (null before Discord issues one), `last_viewed` is the current Discord-epoch day, and `flags` is sent only when the recomputed guild/thread value differs from Ready state. Manual-unread fields remain explicit-action-only. | Current first-party and Paicord; S−. |
+| `POST /read-states/ack-bulk` | Explicit “Mark Server as Read”; at most 100 unread channel/thread entries per sequential request, each containing `channel_id`, `message_id`, and channel `read_state_type:0`. | Current first-party; P−, S−. |
+| `PATCH /users/@me/guilds/{guild-or-@me}/settings` | One explicit channel notification change; a single partial `channel_overrides` entry. | Current first-party; P− and S− for the private `@me` scope. |
+| `PATCH /users/@me/guilds/settings` | One explicit server or category notification change; `guilds` contains exactly one partial guild entry. Category changes contain one category-keyed `channel_overrides` entry and only the selected notification, mute, or collapse fields. | Current first-party; P−, S−. |
+| `GET /guilds/{guild}/application-command-index`, `/channels/{channel}/application-command-index`, `/users/@me/application-command-index`, or `/applications/{application}/application-command-index` | Target-specific index; at most three created GETs for the reviewed `202`/`429` readiness flow. | Current first-party route family; P−, S−. |
+| `POST /interactions` | One explicit type-2 execution, type-4 autocomplete, or returned modal submission; nonce-keyed, one attempt. | Current first-party and Paicord command model; Swiftcord has no current index/interaction path. |
+| `POST /channels/{channel}/messages` | One explicit send; `content`, nonce, `tts:false`, `flags:0`, macOS `mobile_network_type:"unknown"`, optional reply/attachments, and `X-Context-Properties` location `chat_input`. SakuraCord deliberately adds `enforce_nonce:true` to ordinary composer sends. An explicit forward uses the same route once per selected destination (maximum five), empty `content`, nonce without `enforce_nonce`, `message_reference` with `type:1` and source IDs, and context location `forwarding`. Selected forwards start together and settle independently. Optional user-entered context is one later ordinary send per successful destination unless slowmode without bypass forbids it. Picker browsing and typing perform no HTTP or Gateway search. | Current first-party build and clean macOS CDP request/search observation. Pinned Paicord has no forward request/picker, and Swiftcord v1 has no forward path. DiscordKit's later DTO-only snapshot support is decoding evidence, not request or picker evidence. |
+| `POST /channels/{channel}/attachments` | Explicit files only; `files` entries contain string index `id`, `filename`, `file_size`, and `is_clip:false`. | Current first-party upload action and Paicord; Swiftcord has no comparable presigned upload. |
+| `PUT {Discord-issued upload_url}` | One unauthenticated storage PUT per reserved file, `application/octet-stream`, raw bytes, no Discord authorization metadata. | Current first-party and Paicord; S−. |
+| `PATCH` or `DELETE /channels/{channel}/messages/{message}` | Explicit edit with only `content`, or explicit deletion with no body. | Public message semantics and all three references. |
+| `PUT` or `DELETE /channels/{channel}/messages/{message}/reactions/{emoji}/@me` | One coalesced explicit reaction intent; empty body. | Public reaction semantics and all three references. |
+| `GET /channels/{channel}/messages/{message}/reactions/{emoji}` | Visible reactor preview only; `type=0&limit=5`, no pagination. | Public reaction-user semantics and current first-party; Paicord/Swiftcord provide historical reaction reads. |
+| `GET /channels/{dm}/call` | One-to-one explicit call start readiness read only; no body. | Current first-party; P−, S− for the current readiness contract. |
+| `POST /channels/{dm}/call/ring` | Explicit call start after pushed call creation; `recipients:null` or the explicit recipient list. | Current first-party; Paicord partial, S−. |
+| `POST /channels/{dm}/call/stop-ringing` | Explicit decline; nonempty `recipients` list. | Current first-party; Paicord partial, S−. |
+
+The first-party asset also defines `/gifs/select`, `/gifs/suggest`, and
+`/gifs/trending-search`. They are not required for picker content, search,
+favourite persistence, or message sending and SakuraCord deliberately does not
+issue those analytics/suggestion requests. A picker open creates the landing
+read and the shared settings read only. Search and trending each create one
+GET, and each favourite action creates one non-retried PATCH.
+
+### Attachment selection and external-host fallback
+
+Before an attachment enters a composer, SakuraCord applies Discord's current
+per-file account cap using binary byte counts: 10 MiB for a base account,
+50 MiB for Nitro Basic or legacy Nitro Classic, and 500 MiB for Nitro. A file
+at the exact boundary is accepted. A larger file is rejected during selection,
+before `/channels/{channel}/attachments` can be reserved; the provider repeats
+the check as a fail-closed guard.
+
+The 5 August 2026 evidence for this mapping is Discord's public
+[account-caps article](https://support.discord.com/hc/en-us/articles/33694251638295-Discord-Account-Caps-Server-Caps-and-More),
+the public [user resource](https://docs.discord.com/developers/resources/user)
+premium-type values, and current production web asset
+`web.d96787f461ff77e9.js` (SHA-256
+`216e7f6ce5c61983a33254229f76773984545f0a35402dca7c3376176573215e`).
+That asset maps premium types 1 and 3 to `0x3200000`, type 2 to
+`524288000`, and the default to `0xa00000`, and rejects only when
+`file.size > maximum`. Paicord revision
+`694761c1938b73bb60bd58942674dfe73aab1135` independently performs its size
+check before staging in `Common/Chat/Input/InputBar.swift` and uses the same
+tier values in `Utilities/PaicordLib++/NitroHelper.swift`. Swiftcord v1 revision
+`14465d927ebe1ba34b3befa00f9365fad7b56eb9` has a corresponding pre-attach
+check in `Swiftcord/Utils/Extensions/MessagesView+.swift`, but its fixed 8 MiB
+value is historical and was not adopted. Static first-party and public evidence
+left no material request-shape ambiguity, so no authenticated upload was made
+for this audit.
+
+An oversized ordinary-message attachment may expose these separate,
+user-selected third-party actions:
+
+| Endpoint | Bound and body | Result handling |
+| --- | --- | --- |
+| `POST https://catbox.moe/user/api.php` | At most 200,000,000 bytes (advertised as 200 MB); anonymous multipart `reqtype=fileupload` and `fileToUpload`. | Accept only an HTTPS `files.catbox.moe` response; the file is permanent. |
+| `POST https://litterbox.catbox.moe/resources/internals/api.php` | At most 1,000,000,000 bytes (advertised as 1 GB); anonymous multipart `reqtype=fileupload`, `time=24h`, and `fileToUpload`. | Accept only an HTTPS `litter.catbox.moe` response; the file expires after 24 hours. |
+
+These requests never carry a Discord credential, cookie, message body, or
+Discord client metadata. Nothing is uploaded until the user chooses a named
+host in the size warning. Success adds the returned URL to the same draft for
+review; it never sends a Discord message. Cancellation or failure performs no
+Discord mutation. Catbox's documented blocked executable and document
+extensions are rejected locally. The implementation was cross-checked against
+Equicord's GPL-licensed
+[`FileUpload` plugin](https://github.com/Equicord/Equicord/tree/main/src/equicordplugins/fileUpload)
+for behavior only and independently implemented against Catbox's official
+[tools/API documentation](https://catbox.moe/tools.php),
+[service limits](https://catbox.moe/), and [FAQ](https://catbox.moe/faq.php).
+
+Shared request metadata now matches the non-secret fields observed from the
+clean host: product OS version rather than Darwin kernel version, actual system
+locale, Chromium's ordered language preference header, current client/build
+versions, `client_event_source:null`, and client-generated launch,
+launch-signature, and heartbeat-session identifiers. `client_app_state`
+follows the real main-window focused/unfocused state. The current host includes
+`native_build_number:87263`. Pre-login authentication carries the legitimately
+issued fingerprint and installation ID, but omits
+`client_heartbeat_session_id` until Gateway startup, matching the clean host.
+Successful authentication clears the fingerprint before Gateway startup and
+subsequent production REST requests while the persisted installation ID
+remains in `X-Installation-ID`, matching the clean client. `X-Routing-Key`
+remains absent for normal users; the first-party value is a staff/developer
+override, not a client-generated identifier.
+
 Diagnostics payloads are allowlisted and redacted before they enter the
 in-memory store. The export may retain protocol metadata and snowflake IDs, but
 never retains credentials, cookies, challenge values, message content, names,
@@ -110,7 +474,10 @@ The default attempt budget is exact:
 | Ordinary authenticated GET | 2; the second attempt occurs only after a server `429` cooldown. |
 | Authenticated mutation | 1; no automatic replay after `429`, timeout, or ambiguous failure. |
 | Application-command index readiness | 3 created GETs for the separately tested `202`/`429` flow. |
-| Native authentication status retry | Original plus at most 3 Paicord-policy retries for `429`, `500`, `502`, or `504`, subject to its delay ceiling. |
+| Cold native installation/fingerprint preflight status retry | Each created preflight request has its original attempt plus at most 3 bounded retries for `429`, `500`, `502`, or `504`, subject to the established delay ceiling. A missing Apex installation creates only the already-required `/experiments` request, without an additional probe. |
+| Pending-QR or stored-session missing-installation repair | Once per provider: 1 unauthenticated Apex GET, plus 1 unauthenticated `/experiments` GET only when Apex fails or omits the identity. Both are best-effort; no automatic retry or authentication replay, and Gateway proceeds without the optional identity when unavailable. |
+| Native password/MFA status retry | Original plus at most 2 current-official retries for `429`, `500`, `502`, or `504`, subject to the established delay ceiling. |
+| Remote-auth ticket status retry | Original plus at most 3 Paicord-policy retries for `429`, `500`, `502`, or `504`, subject to its delay ceiling. |
 | User-completed login CAPTCHA | At most 1 replay of the challenged request. |
 
 Any `429` pauses authenticated traffic until the server-provided cooldown.
@@ -126,12 +493,49 @@ Authentication failures, account restrictions, verification/challenge
 responses, invalid client metadata, malformed mutation responses, and repeated
 unexpected not-found responses can open the session-wide safety circuit.
 Ordinary resource-scoped permission failures remain scoped when the decoded
-Discord error does not indicate an account/session condition.
+Discord error does not indicate an account/session condition. Expected
+resource-scoped not-found responses, including an unavailable user profile,
+remain scoped to the initiating presentation.
 
 ## Gateway contract
 
-`GatewaySession` is the sole socket owner. The current baseline uses API v9
-JSON with `zlib-stream`, not the official desktop ETF/`zstd-stream` path.
+`GatewaySession` is the sole socket owner. Production uses the clean desktop's
+API v9 ETF encoding with `zstd-stream`. JSON with `zlib-stream` remains only as
+an injectable deterministic test transport and as the historical web/Swiftcord
+cross-reference.
+
+Each zstd WebSocket message is decompressed through one connection-lifetime
+context and is drained until both its compressed input and any pending decoder
+output are exhausted. Consuming the final input byte is not sufficient when
+the decoder filled its output buffer. Discord's current Gateway documentation
+requires repeated `ZSTD_decompressStream` calls and explicitly notes that its
+return value need not reach zero; pinned Paicord likewise continues whenever
+its destination buffer is full. Swiftcord v1/DiscordKit uses JSON with zlib and
+has no zstd counterpart. A sanitized 4 August 2026 live startup exposed the
+regression as exactly 589,824 partial bytes (nine 64 KiB chunks) from a large
+ETF Ready payload; the corrected decoder retains the existing 8 MiB compressed
+and 16 MiB decompressed safety bounds.
+
+ETF maps may use 64-bit integer keys even though the equivalent JSON object can
+only expose string keys. The clean 4 August large-account Ready payload did so;
+SakuraCord now converts integer keys to their exact decimal spelling without a
+floating-point round trip. This follows Discord's documented ETF rule that
+snowflakes may be 64-bit integers or strings and produces the same object-key
+shape consumed by the JSON web, Paicord, and Swiftcord paths.
+
+The same rule applies to ETF integer values outside JavaScript's exact integer
+range: they are normalized to exact decimal strings before DTO decoding rather
+than passing through `Double`. Safe-range counters and timestamps remain JSON
+numbers. This preserves guild, channel, user, message, and role snowflakes on
+large Ready payloads while matching the JSON representations used by the other
+reviewed clients.
+
+ETF `STRING_EXT` is normalized as the byte-list it represents, not as UTF-8
+text. A sanitized 4 August 2026 desktop session used that compact term for the
+two-integer `range` in `GUILD_MEMBER_LIST_UPDATE`; treating it as text caused
+the complete member-list update to fail decoding. The resulting JSON array
+matches the current first-party JSON shape and pinned Paicord's `IntPair`.
+Swiftcord v1 has no corresponding member-list implementation.
 
 The state machine covers:
 
@@ -145,9 +549,9 @@ any state -> stopped
 Durable requirements:
 
 - one Identify or Resume after each new Hello;
-- a randomized first heartbeat and documented opcode-1 heartbeats;
+- a randomized first heartbeat and current desktop QoS opcode-40 heartbeats;
 - ACK tracking and reconnect after a missed ACK;
-- persisted session ID, resume URL, and sequence;
+- in-memory session ID, resume URL, and sequence for same-process Resume;
 - Resume before a fresh Identify when state is valid;
 - explicit invalid-session and close-code handling;
 - bounded, jittered reconnect backoff;
@@ -155,26 +559,176 @@ Durable requirements:
   socket; and
 - explicit stop/logout with no reconnect.
 
-SakuraCord deliberately does not copy the official client's undocumented QoS
-heartbeat envelope or native-codec identity. Metadata must be understood and
-sourced from the real local/session environment.
+The complete outgoing main-Gateway opcode surface is 2 Identify, 3 presence, 4
+voice state, 6 Resume, 8 bounded guild-member request/search, 13 private-call
+subscription, 37 bulk guild subscription, 40 QoS heartbeat, and 41 time-spent
+session update. After Ready, the desktop lifecycle order is 4 (null voice
+state), 3 (current presence), 41, then 40. QoS payloads use version 29 and only
+the locally known `foregrounded` reason; heartbeat sessions rotate after 30
+minutes inactive and the REST super-properties update with the same session.
+Paicord supplies current JSON/zstd and 40/41 cross-checks. Swiftcord v1 supplies
+the historical JSON/zlib and opcode-1 subset and has no 13, 37, 40, or 41.
+
+Current first-party Identify normally uses capability bitfield `1734653`; the
+clean account received `1767421` because the first-party
+`private_channel_obfuscation` experiment adds bit 15. SakuraCord deliberately
+does not advertise that dynamic bit until it implements the corresponding
+obfuscated-private-channel reconciliation. This is the remaining Gateway
+metadata difference and prevents requesting a payload shape the app cannot yet
+consume.
+
+### Dispatch reconciliation
+
+The complete inbound dispatch surface was rechecked on 3 August 2026 against
+Discord's current public Gateway event catalogue, public web build `587597`
+and asset `web.a8c0f0f55a5a68c4.js`, Paicord revision
+`694761c1938b73bb60bd58942674dfe73aab1135`, Swiftcord v1 revision
+`14465d927ebe1ba34b3befa00f9365fad7b56eb9`, and DiscordKit revision
+`2d42c69cafe592300a1a9d3a307bf485294026c7`. The official asset's route
+converters and stores resolved the event shapes and cache ownership without a
+material ambiguity, so this pass required no authenticated action or new live
+traffic capture. Paicord decodes the current lifecycle and secondary-feature
+families. Swiftcord v1 and DiscordKit provide historical lifecycle coverage but
+omit several newer voice, AutoMod, entitlement, subscription, and event-
+exception dispatches.
+
+- `GUILD_CREATE` adds or restores the guild, its rail entry, channels, roles,
+  members, threads, emoji, and voice state. `GUILD_UPDATE` patches every guild
+  field SakuraCord models. `GUILD_DELETE` with `unavailable:true` retains and
+  marks the guild unavailable; an ordinary delete removes its guild-scoped
+  caches, requests, channels, and rail entry. Joining, becoming unavailable,
+  recovering, and leaving issue no compensating REST request.
+  A 4 August 2026 follow-up found two desktop-specific decoding boundaries.
+  ETF can represent a permission bitfield as an integer even though Discord's
+  public JSON guild schema uses a string. More importantly, current first-party
+  build `587597` handles Guild Create as an envelope with `id`, `data_mode`, and
+  guild identity nested under `properties`, while the public event description
+  and pinned Paicord model remain flat; pinned Swiftcord v1 has no corresponding
+  current handler. A private sanitized SakuraCord diagnostic recorded the
+  failed live join as sequence 131 `GUILD_CREATE`, followed by guild catalog and
+  member activity, proving the event arrived but its identity was not decoded.
+  Gateway Ready and Guild Create now accept flat or nested identity plus string
+  or integer permissions. Missing collections in a partial event preserve the
+  existing channel and role catalogs. Current-shape fixtures prove the guild and
+  rail entry reconcile without a compensating REST request.
+- Guild `CHANNEL_CREATE`, `CHANNEL_UPDATE`, and `CHANNEL_DELETE` reconcile a
+  raw per-guild channel catalogue before rebuilding presentation. This retains
+  categories, positions, permission overwrites, pins, and voice metadata, so a
+  permission or category change takes effect without a channel-list reload.
+  `GUILD_ROLE_*`, `GUILD_MEMBER_*`, and `USER_UPDATE` likewise update the
+  shared role, member, permission, current-user, DM-recipient, and loaded-
+  message projections without a REST probe.
+- `MESSAGE_DELETE_BULK` removes every named loaded message and publishes the
+  same per-message deletion boundary as a single delete.
+  `CHANNEL_PINS_UPDATE`, `THREAD_MEMBERS_UPDATE`,
+  `VOICE_CHANNEL_STATUS_UPDATE`, and `VOICE_CHANNEL_START_TIME_UPDATE` update
+  their cached channel or thread fields in place. Voice start times accept the
+  documented Unix-seconds representation; ISO timestamps remain a lossless
+  compatibility input for first-party-normalized channel objects.
+- A `RATE_LIMITED` dispatch records Discord's `retry_after` seconds against
+  the rejected outgoing opcode. A send attempted during that cooldown fails
+  locally, and a rejected member request completes its pending continuation
+  with an error. SakuraCord does not replay, retry early, or speculate about a
+  replacement Gateway request.
+- Sticker, soundboard, scheduled-event and exception, Stage, poll-vote,
+  integration, webhook, AutoMod, entitlement, and subscription dispatches have
+  no production state consumer. They are deliberately ignored after sanitized
+  transport diagnostics instead of occupying the application event stream or
+  maintaining unused caches. They do not enable an unsupported feature, add
+  fan-out, or trigger an authenticated read.
+
+All of these paths use sanitized deterministic dispatch fixtures. Their
+request budget is zero: a received dispatch mutates local state and never
+creates a REST request or an additional outgoing Gateway payload.
+
+### Other Discord transports
+
+The HTTP table above is the complete API REST and issued-upload surface, but it
+is not the whole network surface. The remaining production connections are:
+
+- the main Gateway WebSocket at `wss://gateway.discord.gg` (or the
+  server-provided resume URL) with the exact `v=9`, `encoding=etf`, and
+  `compress=zstd-stream` query. It carries only the outgoing opcodes listed
+  above and decodes pushed dispatches into the shared cache/state model;
+- the unauthenticated remote-login WebSocket at
+  `wss://remote-auth-gateway.discord.gg/?v=2`. It uses an ephemeral URL session
+  without cookie storage, an ephemeral RSA key, and the reviewed User-Agent,
+  Origin, Cache-Control, and Accept-Language headers. It never receives the
+  account authorization token; only the server-issued ticket is exchanged by
+  the central authenticated REST transport after user approval;
+- a voice Gateway WebSocket at the endpoint supplied by
+  `VOICE_SERVER_UPDATE`, normalized to `wss://{endpoint}?v=8`, followed by UDP
+  discovery and encrypted RTP to the server-supplied IP and port. This path is
+  reached only by an explicit voice/call action and uses the existing
+  DAVE-capable voice state machine; and
+- unauthenticated HTTPS media GETs to `cdn.discordapp.com` and
+  `media.discordapp.net` for server-returned or locally derived Discord asset
+  paths. These loads use an isolated ephemeral URLSession with memory-cache
+  semantics and cookie storage explicitly disabled. They carry no
+  Authorization, client-properties, fingerprint, installation ID, or
+  routing-key headers and use a shared coalescing/cancellation queue. Inline
+  linked images are accepted only on those exact HTTPS hosts, without
+  credentials or a custom port; SakuraCord does not fetch arbitrary
+  third-party link previews.
+- unauthenticated GIF-picker media GETs use the response-provided HTTPS
+  origins, without credentials or a nonstandard port, matching the current
+  first-party picker rather than Discord's separate asset-action host helper.
+  Response-provided and locally derived media URLs pass this transport-safety
+  policy before any image loader or AVFoundation use. These GETs use the same
+  isolated ephemeral, cookie-free,
+  bounded coalescing/cancellation queue as Discord media. Native video is
+  streamed through that queue to an app-controlled temporary file before
+  AVFoundation opens the local file; AVFoundation never receives a remote
+  URL. Tenor WebM results may use corresponding MP4 and GIF representations.
+  Klipy results use the response-provided WebP directly; SakuraCord does not
+  invent an MP4 URL by changing the Klipy WebM extension. A visible result
+  creates at most three distinct media requests. Cell reuse, viewport exit,
+  or picker dismissal cancels
+  waiters and removes staged video files. No Authorization, client metadata,
+  fingerprint, installation, Discord routing, or cookie header is added.
+
+The current official desktop and SakuraCord use ETF with `zstd-stream` for the
+main Gateway. The public web client uses JSON with compressed Gateway
+transport, Paicord uses JSON plus zstd, and Swiftcord v1 uses historical JSON
+plus zlib.
 
 ## Authentication
 
 Native authentication is implemented without an embedded Discord login page:
 
-- a cold password login performs experiments/fingerprint, login, then
-  current-user validation;
-- a warm password login performs login and validation;
+- a cold password login performs the Apex installation preflight, the
+  installation-bearing fingerprint preflight, login, then connects Gateway;
+  when Apex fails or omits its installation, that same fingerprint preflight
+  resolves the required fingerprint without an installation header before
+  login and retains an installation only when Discord returns one;
+- a warm password login performs login and then connects Gateway;
+- an approved QR credential or stored credential missing only its installation
+  identity performs one best-effort unauthenticated Apex lookup and, only if
+  needed, one `/experiments` fallback before connecting Gateway without
+  replaying login; when both omit it, Gateway Identify omits the optional field;
 - MFA adds one explicit verification request;
 - hCaptcha is completed by the user and permits one challenged-request replay;
 - QR login uses one remote-auth v2 WebSocket, an ephemeral RSA key, one ticket
-  exchange, and one current-user validation after approval; and
-- only a validated session credential enters `KeychainCredentialStore`.
+  exchange, then connects the main Gateway after approval; and
+- the returned credential remains memory-only until `READY.user` supplies a
+  valid account ID, at which point it enters `KeychainCredentialStore` exactly
+  once. Cancellation, bootstrap failure, or an omitted Ready user discards it.
 
-Passwords, challenge solutions, fingerprints, and credentials are never
-written to preferences, fixtures, GRDB, or logs. A cancelled or rejected
-challenge does not create another request.
+Passwords, challenge solutions, and credentials are never written to
+preferences, fixtures, GRDB, or logs. The server-issued fingerprint and
+installation ID are persisted only in local preferences to reproduce the
+first-party lifecycle; neither value is logged or committed. A cancelled or
+rejected challenge does not create another request.
+
+The clean desktop additionally read `/auth/location-metadata` for its own
+country, consent, and promotional UI and emitted science traffic before the
+user submitted the form. SakuraCord has no corresponding UI or analytics
+consumer, so it deliberately does not add those unrelated requests. The clean
+success path connected Gateway immediately after `/auth/login`; SakuraCord now
+uses that same ordering. Swiftcord v1 independently corroborates the pending
+token → Gateway Ready user → account-store sequence. Paicord performs an extra
+pre-Gateway current-user read and was retained only as conflicting evidence,
+not copied into the production path.
 
 ## Established feature contracts
 
@@ -183,9 +737,26 @@ implementation records.
 
 ### Messages, typing, mentions, and links
 
+- Process startup never presents a persisted Discord workspace or message
+  page. A data-free full-layout skeleton remains visible until the live Ready
+  bootstrap is applied. Message pages, pagination boundaries, prepared rows,
+  and Gateway deltas are retained only in bounded process memory. Reopening a
+  loaded channel therefore issues zero history requests, while relaunching the
+  app deliberately starts empty and performs the one reviewed `limit=10`
+  newest-page read after Ready. The 3 August first-party bundle performs its
+  initial read only for an uncached selection. Pinned Paicord retains one
+  `ChannelStore` per channel and likewise reuses it on selection; pinned
+  Swiftcord v1 is the historical outlier that clears and refetches on every
+  channel change. A clean-client CDP rapid-navigation trace on 10 August showed
+  three dispatched `limit=10` reads all finishing after their selections were
+  superseded; SakuraCord therefore cancels only stale presentation and lets the
+  bounded transport reads finish into its provider caches. Discord's public
+  message documentation defines the endpoint, permissions, and pagination
+  parameters but does not prescribe client cache or cancellation lifetime.
 - One user send creates one message POST with a Discord-epoch nonce,
-  `enforce_nonce: true`, an `attachments` array, and `chat_input` context. The
-  body contains no `mobile_network_type` field.
+  `enforce_nonce: true`, `tts: false`, `flags: 0`, the clean macOS host's
+  `mobile_network_type: "unknown"`, attachments only when present, and
+  `chat_input` context.
 - Local typing waits 1.5 seconds, then sends at most one empty typing POST per
   eight-second activity window. Draft restoration, send, empty draft, channel
   change, and unsupported channel types cancel pending typing.
@@ -206,7 +777,7 @@ implementation records.
   typed deltas to loaded messages without a history reload. Current-user normal
   and burst state are reconciled independently so the Gateway echo of one
   optimistic REST toggle cannot change the aggregate count twice. Each delta
-  fans out to visible, cached, thread, forum-preview, and persisted message
+  fans out to visible, session-cached, thread, and forum-preview message
   state without issuing another authenticated request. The typed reaction
   event is the sole presentation delta; updating the provider's forum cache
   does not also publish a catalogue replacement for the same Gateway event.
@@ -280,8 +851,10 @@ implementation records.
 - Server folders decode from Ready `user_settings_proto` and subsequent
   settings updates. Folder rendering, ordering, and expansion add no REST
   request.
-- Selecting voice-channel text chat uses the ordinary one-page message-history
-  read and does not join voice. Reopening an already open pane adds no request.
+- Selecting accessible voice-channel text chat uses the ordinary one-page
+  message-history read and does not join voice. Effective `VIEW_CHANNEL`,
+  `READ_MESSAGE_HISTORY`, and `CONNECT` are required before that read;
+  reopening an already open pane adds no request.
 
 ### Guild metadata and member lookup
 
@@ -340,15 +913,63 @@ implementation records.
   implementation removes that invalid field, matches the first-party and
   Paicord request shape, and reconciles the observed nonce-less response by
   guild plus the returned and `not_found` user IDs.
-- The channel member inspector keeps the official client's single initial
-  `0...99` member-list range and treats `GUILD_MEMBER_LIST_UPDATE.groups` as
-  the authority for group order and counts. Loaded member rows retain their
-  Gateway order; SakuraCord does not infer totals from the virtualized slice.
-  This was rechecked on 31 July 2026 against public web asset
-  `web.505415119e321976.js` and pinned Paicord's member-list store. Discord's
-  public Gateway documentation does not describe opcode 37 or this dispatch;
-  Swiftcord v1 has no corresponding implementation. The change adds no
-  request and preserves the existing one-payload subscription budget.
+- The channel member inspector always retains the official client's initial
+  `0...99` member-list range, then adds only the 100-aligned blocks intersecting
+  the visible rows plus half a viewport of prefetch on either side. A payload
+  contains at most five range pairs, subscriptions use a five-member-list-ID
+  LRU, and scrolling samples the latest viewport at most once every 300
+  milliseconds. Channels with the same permission view share one list ID and
+  one request-budget slot. The server-provided `member_list_id` is
+  authoritative; its deterministic permission-overwrite hash is used only as
+  the first-party-compatible fallback. Equal range sets for the same list ID
+  are not resent. Each update remains one guild-scoped opcode-37 payload
+  containing one representative channel per retained list ID. It is not an
+  opcode-8 member request, REST read, or account mutation.
+  `GUILD_MEMBER_LIST_UPDATE.id` routes operations and authoritative group order
+  and counts into separate per-ID accumulators. Changing between a public and
+  permission-overwritten channel immediately selects that accumulator, so
+  revisiting a public channel cannot retain a restricted channel's members or
+  counts. Loaded members retain their absolute Gateway list indexes. The
+  renderer preserves `MemberSection.make` order and keeps unresolved capacity
+  after the currently loaded members in each authoritative section, so sparse
+  Gateway indexes cannot create blank rows between already resolved members.
+
+  This contract was statically rechecked on 5 August 2026 against current
+  first-party asset `web.1f98726096a7c0ce.js` (SHA-256
+  `592320633d203814eb03f5127552985ca335bb9e4c7eb3ab3aa0a76a0173c80a`).
+  Its modules `36124`, `361610`, and `63238` respectively establish the
+  100-row block and initial range, half-viewport/100-boundary range planning,
+  and equality-deduplicated subscription store. Module `202613` preserves the
+  server `memberListId`; otherwise it returns `everyone` for a public
+  permission view or the unsigned MurmurHash3 value of sorted `allow:<id>` and
+  `deny:<id>` VIEW_CHANNEL overwrite entries.
+  Pinned Paicord's `GuildMemberList.swift` independently keeps `0...99`, adds
+  viewport-derived 100-row blocks with at most three pairs, and debounces for
+  300 milliseconds. Its `GuildStore` stores accumulators and a bounded
+  subscription LRU by member-list ID, converts each ID to one representative
+  channel for the wire payload, and applies an update only to the accumulator
+  matching `update.id`. Its `ChannelStore` uses the same server-ID-first,
+  permission-hash fallback. Pinned Swiftcord v1 has no opcode-37, member-list
+  ID, member-list update, or virtual member-range implementation.
+  Discord's current public Gateway documentation describes the distinct
+  opcode-8 Request Guild Members contract, a 4,096-byte payload ceiling, and
+  120 outgoing Gateway events per 60 seconds, but does not document opcode 37
+  or `GUILD_MEMBER_LIST_UPDATE`. Static first-party behavior was unambiguous,
+  so no authenticated traffic capture was required to resolve protocol shape.
+- Nameplate media follows the current first-party SKU asset resolver. A decoded
+  `collectibles.nameplate.sku_id` maps to
+  `https://cdn.discordapp.com/media/v1/collectibles-shop/{sku}/static` for the
+  resting frame and the sibling `/animated` asset for hover. Response-provided
+  asset URLs and the historical asset-path convention remain compatibility
+  fallbacks only when `sku_id` is absent. Discord's public User resource defines
+  `sku_id`, `asset`, `label`, and `palette`. Current first-party asset
+  `web.1f98726096a7c0ce.js` modules `746002`, `253292`, and `174755` establish
+  the SKU URL, static-first presentation, and hover animation selection. Pinned
+  Paicord still derives `assets/collectibles/{asset}/static.png` and `img.png`;
+  that historical path fails for some current nameplates. Pinned Swiftcord v1
+  has no collectibles/nameplate implementation. This was statically rechecked
+  on 5 August 2026 after a live SakuraCord member showed an absent resting asset
+  but a working hover animation.
 - Hidden-channel metadata and effective access are derived from cached guild,
   role, member, and permission-overwrite data. Displaying the last-message
   snowflake time or allowed overwrite identities does not load hidden content.
@@ -425,6 +1046,61 @@ capture was used for this recheck.
   `@me` user-guild settings through `USER_GUILD_SETTINGS(@me)` rather than the
   bulk guild endpoint. No authenticated account action or traffic capture was
   used.
+- A user-selected server notification or mute change sends one immediate
+  `PATCH /users/@me/guilds/settings` through the same central transport. Its
+  body contains one guild ID under `guilds` and only the selected
+  `message_notifications`, or `muted` plus `mute_config`, fields. A server
+  “Mark as Read” action sends only SakuraCord's currently unread, accessible
+  channel and joined-thread states to `POST /read-states/ack-bulk`, with at
+  most 100 entries in each sequential request. The UI applies those read
+  boundaries optimistically and rolls them back on failure; notification
+  settings apply locally only after success. Authoritative
+  `USER_GUILD_SETTINGS_UPDATE` events still reconcile notification state.
+  This contract was statically checked on 2026-08-04 against Discord public
+  web build `588119` and asset `web.1f98726096a7c0ce.js`, Discord's current
+  public rate-limit and status-code documentation, Paicord revision
+  `694761c1938b73bb60bd58942674dfe73aab1135`, and Swiftcord v1 revision
+  `14465d927ebe1ba34b3befa00f9365fad7b56eb9`. The public documentation does
+  not describe either user-client route. Paicord's server-icon menu only
+  copies the guild ID and neither pinned reference implements these server
+  mutations. No authenticated request or traffic capture was used.
+- A category is a first-class user-guild-settings override keyed by its
+  category channel ID; changing it does not rewrite or mute any child channel's
+  server-side override. A category notification selection sends one immediate,
+  single-attempt `PATCH /users/@me/guilds/settings` whose `guilds` object
+  contains exactly one guild and whose `channel_overrides` object contains
+  exactly one category with `message_notifications`. Child channels without a
+  direct setting inherit that category value at notification-decision time,
+  while direct child overrides remain authoritative for their own setting.
+  Category mute sends only `muted` and `mute_config`; it suppresses
+  notifications inherited by the category's child channels and joined threads
+  without making those child channel overrides muted, suppressing their own
+  unread styling, or inferring a collapsed presentation. Unread children of a
+  muted category remain visible as unread inside the server but do not produce
+  the server-rail unread marker. Manual category collapse/expand sends only the
+  `collapsed` field, and the sidebar follows that authoritative field
+  independently from mute state. Ready and `USER_GUILD_SETTINGS_UPDATE` decode all four fields
+  from the category override. “Mark Category as Read” sends only unread,
+  accessible direct children and joined threads whose parent belongs to the
+  category through the existing `POST /read-states/ack-bulk` batching contract.
+  The category menu otherwise mirrors the channel menu but omits Copy Link.
+
+  This contract was statically checked on 2026-08-07 against Discord public web
+  build `589089`, version hash
+  `cf63e91c5378d3376ec2c615530e8ae0706aed51`, and clean public asset
+  `web.3cd0f98a15f63be2.js` (SHA-256
+  `a77974b18a92b7d5452d4138b0b276f380ac498fd7fefa1b9aa7e183ace0f4f0`),
+  Discord's public channel-type, status-code, Gateway, and rate-limit
+  documentation, Paicord revision
+  `694761c1938b73bb60bd58942674dfe73aab1135`, and Swiftcord v1 revision
+  `14465d927ebe1ba34b3befa00f9365fad7b56eb9`. The current signed and notarized
+  Discord desktop 0.0.406 presentation and the supplied 2026-08-07 category
+  menu screenshot confirmed the visible menu shape; no category setting was
+  changed in an authenticated account and no traffic was captured. The public
+  API documentation identifies guild categories as channel type 4 but does not
+  document these user-client settings or acknowledgement routes. Paicord has
+  local category collapse presentation only, and neither pinned reference
+  implements category notification, mute, or bulk acknowledgement mutations.
 - Forum-post notification settings are current-user thread-member state, not
   parent-forum channel overrides. Joined posts send one
   `PATCH /channels/{thread_id}/thread-members/@me/settings`; an unjoined post
@@ -562,12 +1238,14 @@ account action or traffic capture was performed.
   Full profiles use one `GET /users/{user.id}/profile` with
   `with_mutual_guilds`, `with_mutual_friends`, and
   `with_mutual_friends_count` set to `true`; one-to-one DMs omit `guild_id`.
-- Message sends remain independent of channel selection. The Paicord-aligned
-  JSON shape is `content`, `nonce`, and an `attachments` array, plus a reply
-  reference containing type `0`, `message_id`, and `channel_id` when needed.
-  The `X-Context-Properties` location is `chat_input`. Concurrent calls with
-  the same channel and nonce share one in-flight mutation.
-- SakuraCord deliberately adds `enforce_nonce: true` to Paicord's body. Discord
+- Message sends remain independent of channel selection. The current
+  first-party JSON shape is `mobile_network_type`, `content`, `nonce`, `tts`,
+  and `flags`, plus attachments only when present and a reply reference
+  containing type `0`, `message_id`, and `channel_id` when needed. The
+  `X-Context-Properties` location is `chat_input`. Concurrent calls with the
+  same channel and nonce share one in-flight mutation.
+- SakuraCord deliberately adds `enforce_nonce: true` to the first-party and
+  Paicord bodies. Discord
   publicly documents this as returning the already-created message for a
   duplicate nonce, and SakuraCord's safety contract requires that stronger
   idempotency boundary. This is the sole reviewed body-shape difference.
@@ -575,7 +1253,7 @@ account action or traffic capture was performed.
   replay an ambiguous result automatically.
 - Swiftcord v1 supplied a historical existing-DM history and send reference. It
   omits a nonce and permits a manual retry after failure, so SakuraCord follows
-  Paicord's current shape plus the stricter nonce, deduplication, and
+  the current first-party shape plus the stricter nonce, deduplication, and
   one-attempt safety rules above.
 
 ### Private calls

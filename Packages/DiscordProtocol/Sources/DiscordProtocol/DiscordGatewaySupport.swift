@@ -2,8 +2,29 @@ import Foundation
 import SakuraCordModels
 
 enum DiscordGatewayPayloadFactory {
-    static func guildSubscriptions(guildID: GuildID, channelID: ChannelID?) -> [String: Any] {
-        let channels: [String: Any] = channelID.map { [$0.description: [[0, 99]]] } ?? [:]
+    static func guildSubscriptions(
+        guildID: GuildID,
+        channelID: ChannelID?,
+        ranges: [ClosedRange<Int>] = [0 ... 99]
+    ) -> [String: Any] {
+        guildSubscriptions(
+            guildID: guildID,
+            channelRanges: channelID.map { [$0: ranges] } ?? [:]
+        )
+    }
+
+    static func guildSubscriptions(
+        guildID: GuildID,
+        channelRanges: [ChannelID: [ClosedRange<Int>]]
+    ) -> [String: Any] {
+        let channels = Dictionary(
+            uniqueKeysWithValues: channelRanges.map { channelID, ranges in
+                (
+                    channelID.description,
+                    ranges.map { [$0.lowerBound, $0.upperBound] }
+                )
+            }
+        )
         return [
             "op": 37,
             "d": [
@@ -69,6 +90,160 @@ enum DiscordGatewayPayloadFactory {
                 "channel_id": channelID.description
             ] as [String: Any],
         ]
+    }
+}
+
+enum DiscordMemberListRangePolicy {
+    struct SubscriptionState: Equatable {
+        let memberListOrder: [String]
+        let subscriptionsByMemberListID: [String: DiscordMemberListSubscription]
+
+        var rangesByChannel: [ChannelID: [ClosedRange<Int>]] {
+            Dictionary(
+                subscriptionsByMemberListID.values.map { ($0.channelID, $0.ranges) },
+                uniquingKeysWith: { _, newer in newer }
+            )
+        }
+    }
+
+    static let blockSize = 100
+    static let maximumRangePairs = 5
+    static let maximumSubscribedMemberLists = 5
+    static let initialRange = 0 ... 99
+
+    static func ranges(around visibleRange: ClosedRange<Int>) -> [ClosedRange<Int>] {
+        let lower = max(0, visibleRange.lowerBound)
+        let upper = max(lower, visibleRange.upperBound)
+        let viewportCount = max(1, upper - lower + 1)
+        let prefetch = Int(ceil(Double(viewportCount) / 2))
+        let prefetchLower = max(0, lower - prefetch)
+        let prefetchUpper = upper + prefetch
+
+        var ranges = [initialRange]
+        var blockStart = max(blockSize, (prefetchLower / blockSize) * blockSize)
+        while blockStart <= prefetchUpper {
+            ranges.append(blockStart ... (blockStart + blockSize - 1))
+            blockStart += blockSize
+        }
+        guard ranges.count > maximumRangePairs else { return ranges }
+        let nonInitial = Array(ranges.dropFirst())
+        let leadingCount = (maximumRangePairs - 1) / 2
+        let trailingCount = maximumRangePairs - 1 - leadingCount
+        return [initialRange]
+            + nonInitial.prefix(leadingCount)
+            + nonInitial.suffix(trailingCount)
+    }
+
+    static func retainedMemberListOrder(
+        selecting memberListID: String,
+        from current: [String]
+    ) -> [String] {
+        Array(
+            (current.filter { $0 != memberListID } + [memberListID])
+                .suffix(maximumSubscribedMemberLists)
+        )
+    }
+
+    static func subscriptionState(
+        selecting memberListID: String,
+        channelID: ChannelID,
+        ranges: [ClosedRange<Int>],
+        currentSubscriptions: [String: DiscordMemberListSubscription],
+        currentOrder: [String]
+    ) -> SubscriptionState {
+        let memberListOrder = retainedMemberListOrder(
+            selecting: memberListID, from: currentOrder
+        )
+        var subscriptions = currentSubscriptions
+        subscriptions[memberListID] = DiscordMemberListSubscription(
+            channelID: channelID, ranges: ranges
+        )
+        subscriptions = subscriptions.filter { memberListOrder.contains($0.key) }
+        return SubscriptionState(
+            memberListOrder: memberListOrder,
+            subscriptionsByMemberListID: subscriptions
+        )
+    }
+
+    static func requiresSubscriptionUpdate(
+        memberListID: String,
+        ranges: [ClosedRange<Int>],
+        currentSubscriptions: [String: DiscordMemberListSubscription]
+    ) -> Bool {
+        currentSubscriptions[memberListID]?.ranges != ranges
+    }
+}
+
+struct DiscordMemberListSubscription: Equatable {
+    let channelID: ChannelID
+    let ranges: [ClosedRange<Int>]
+}
+
+enum DiscordMemberListIdentity {
+    private static let viewChannel: UInt64 = 1 << 10
+
+    static func id(for channel: Channel, guildID: GuildID, roles: [GuildRoleDTO]) -> String {
+        if let memberListID = channel.memberListID, !memberListID.isEmpty {
+            return memberListID
+        }
+        let everyonePermissions = roles.first(where: { $0.id == guildID.description })
+            .flatMap(\.permissions).flatMap(UInt64.init) ?? 0
+        let everyoneCanView = everyonePermissions & viewChannel != 0
+        let overwrites = channel.permissionOverwrites ?? []
+        if everyoneCanView, !overwrites.contains(where: { $0.deny & viewChannel != 0 }) {
+            return "everyone"
+        }
+        let permissionShape = overwrites.compactMap { overwrite -> String? in
+            if overwrite.allow & viewChannel != 0 { return "allow:\(overwrite.id)" }
+            if overwrite.deny & viewChannel != 0 { return "deny:\(overwrite.id)" }
+            return nil
+        }.sorted().joined(separator: ",")
+        return String(murmurHash3(permissionShape.utf8))
+    }
+
+    private static func murmurHash3(_ bytes: String.UTF8View) -> UInt32 {
+        let data = Array(bytes)
+        var hash: UInt32 = 0
+        let count = data.count
+        let blockCount = count / 4
+        for block in 0 ..< blockCount {
+            let offset = block * 4
+            var key = UInt32(data[offset])
+                | (UInt32(data[offset + 1]) << 8)
+                | (UInt32(data[offset + 2]) << 16)
+                | (UInt32(data[offset + 3]) << 24)
+            key &*= 0xcc9e2d51
+            key = (key << 15) | (key >> 17)
+            key &*= 0x1b873593
+            hash ^= key
+            hash = (hash << 13) | (hash >> 19)
+            hash = hash &* 5 &+ 0xe6546b64
+        }
+        var tail: UInt32 = 0
+        let tailOffset = blockCount * 4
+        switch count & 3 {
+        case 3:
+            tail ^= UInt32(data[tailOffset + 2]) << 16
+            fallthrough
+        case 2:
+            tail ^= UInt32(data[tailOffset + 1]) << 8
+            fallthrough
+        case 1:
+            tail ^= UInt32(data[tailOffset])
+            tail &*= 0xcc9e2d51
+            tail = (tail << 15) | (tail >> 17)
+            tail &*= 0x1b873593
+            hash ^= tail
+        default:
+            break
+        }
+        hash ^= UInt32(count)
+        hash ^= hash >> 16
+        hash &*= 0x85ebca6b
+        hash ^= hash >> 13
+        hash &*= 0xc2b2ae35
+        hash ^= hash >> 16
+        return hash
     }
 }
 
@@ -170,8 +345,11 @@ enum DiscordMemberStoreOrdering {
     static func merging(existing: [Member], updates: [Member]) -> [Member] {
         var result = existing
         var indexByID = Dictionary(uniqueKeysWithValues: result.indices.map { (result[$0].id, $0) })
-        for member in updates {
+        for var member in updates {
             if let index = indexByID[member.id] {
+                if member.memberListIndex == nil {
+                    member.memberListIndex = result[index].memberListIndex
+                }
                 result[index] = member
             } else {
                 indexByID[member.id] = result.endIndex
@@ -326,7 +504,14 @@ struct GuildVoiceStateSnapshotDTO: Decodable {
 struct GatewayReadyGuildsDTO: Decodable {
     struct GuildReference: Decodable {
         var id: String
+        var name: String?
+        var icon: String?
+        var owner: Bool?
+        var ownerID: String?
+        var permissions: String?
         var rulesChannelID: String?
+        var defaultMessageNotifications: Int?
+        var features: Set<String>
         var voiceStates: [VoiceStateUpdateDTO]
         var emojis: GatewayGuildEmojiCollectionDTO?
         var channels: [ChannelDTO]
@@ -335,8 +520,10 @@ struct GatewayReadyGuildsDTO: Decodable {
         var members: [GuildMemberDTO]
 
         enum CodingKeys: String, CodingKey {
-            case id
+            case id, name, icon, owner, permissions, properties, features
+            case ownerID = "owner_id"
             case rulesChannelID = "rules_channel_id"
+            case defaultMessageNotifications = "default_message_notifications"
             case voiceStates = "voice_states"
             case emojis
             case channels, threads, roles, members
@@ -344,8 +531,27 @@ struct GatewayReadyGuildsDTO: Decodable {
 
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            let nested = try? container.decode(
+                GatewayGuildPropertiesDTO.self, forKey: .properties
+            )
             id = try container.decode(String.self, forKey: .id)
-            rulesChannelID = try? container.decode(String.self, forKey: .rulesChannelID)
+            name = (try? container.decode(String.self, forKey: .name)) ?? nested?.name
+            icon = (try? container.decode(String.self, forKey: .icon)) ?? nested?.icon
+            owner = (try? container.decode(Bool.self, forKey: .owner)) ?? nested?.owner
+            ownerID = (try? container.decode(String.self, forKey: .ownerID))
+                ?? nested?.ownerID
+            permissions = (try? container.decode(
+                StringOrIntegerDTO.self, forKey: .permissions
+            ).value) ?? nested?.permissions
+            rulesChannelID = (try? container.decode(
+                String.self, forKey: .rulesChannelID
+            )) ?? nested?.rulesChannelID
+            defaultMessageNotifications = (try? container.decode(
+                Int.self,
+                forKey: .defaultMessageNotifications
+            )) ?? nested?.defaultMessageNotifications
+            features = (try? container.decode(Set<String>.self, forKey: .features))
+                ?? nested?.features ?? []
             voiceStates =
                 (try? container.decode(
                     LossyList<VoiceStateUpdateDTO>.self,
@@ -372,6 +578,31 @@ struct GatewayReadyGuildsDTO: Decodable {
                     LossyList<GuildMemberDTO>.self, forKey: .members
                 ))?.elements ?? []
         }
+
+        func domain(currentUserID: UserID?) -> Guild? {
+            guard let id = GuildID(id), let name else { return nil }
+            let iconURL = icon.flatMap { hash in
+                URL(
+                    string:
+                        "https://cdn.discordapp.com/icons/\(id)/\(hash).webp?size=128&animated=\(hash.hasPrefix("a_") ? "true" : "false")"
+                )
+            }
+            let isOwnedByCurrentUser = owner
+                ?? ownerID.map { $0 == currentUserID?.description }
+            return Guild(
+                id: id,
+                name: name,
+                iconURL: iconURL,
+                isOwnedByCurrentUser: isOwnedByCurrentUser,
+                currentUserPermissions: permissions.flatMap(UInt64.init),
+                rulesChannelID: rulesChannelID.flatMap(ChannelID.init),
+                features: features,
+                defaultMessageNotifications:
+                    defaultMessageNotifications.flatMap(
+                        MessageNotificationLevel.init(rawValue:)
+                    ) ?? .onlyMentions
+            )
+        }
     }
 
     var guilds: [GuildReference]
@@ -379,6 +610,9 @@ struct GatewayReadyGuildsDTO: Decodable {
     var lazyPrivateChannels: [ChannelDTO]
     var currentUser: UserDTO?
     var users: [UserDTO]
+    var friendUserIDs: Set<UserID>
+    var blockedOrIgnoredUserIDs: Set<UserID>
+    var relationshipNicknamesByUserID: [UserID: String]
     var presences: [PresenceUpdateDTO]
     var mergedPresences: GatewayMergedPresencesDTO
     var mergedMembers: [[ReadyMergedMemberDTO]]
@@ -394,6 +628,7 @@ struct GatewayReadyGuildsDTO: Decodable {
         case lazyPrivateChannels = "lazy_private_channels"
         case currentUser = "user"
         case users
+        case relationships
         case presences
         case mergedPresences = "merged_presences"
         case mergedMembers = "merged_members"
@@ -422,6 +657,46 @@ struct GatewayReadyGuildsDTO: Decodable {
             (try? container.decode(
                 LossyList<UserDTO>.self, forKey: .users
             ))?.elements ?? []
+        struct RelationshipDTO: Decodable {
+            var id: String
+            var type: Int
+            var nickname: String?
+            var user: UserDTO?
+
+            var userIgnored: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case id, type, nickname, user
+                case userIgnored = "user_ignored"
+            }
+        }
+        let relationships =
+            (try? container.decode(
+                LossyList<RelationshipDTO>.self, forKey: .relationships
+            ))?.elements ?? []
+        friendUserIDs = Set(relationships.compactMap {
+            $0.type == 1 ? UserID($0.id) : nil
+        })
+        blockedOrIgnoredUserIDs = Set(relationships.compactMap {
+            $0.type == 2 || $0.userIgnored == true ? UserID($0.id) : nil
+        })
+        relationshipNicknamesByUserID = Dictionary(
+            relationships.compactMap { relationship in
+                guard let id = UserID(relationship.id),
+                      let nickname = relationship.nickname?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !nickname.isEmpty
+                else { return nil }
+                return (id, nickname)
+            },
+            uniquingKeysWith: { _, newer in newer }
+        )
+        for relationship in relationships {
+            guard let user = relationship.user,
+                  !users.contains(where: { $0.id == user.id })
+            else { continue }
+            users.append(user)
+        }
         presences =
             (try? container.decode(
                 LossyList<PresenceUpdateDTO>.self, forKey: .presences
@@ -526,6 +801,7 @@ struct GatewayUserGuildSettingsDTO: Decodable {
         var muted: Bool?
         var muteConfig: MuteConfigDTO?
         var flags: UInt64?
+        var collapsed: Bool?
 
         enum CodingKeys: String, CodingKey {
             case channelID = "channel_id"
@@ -533,6 +809,7 @@ struct GatewayUserGuildSettingsDTO: Decodable {
             case muted
             case muteConfig = "mute_config"
             case flags
+            case collapsed
         }
 
         var domain: ChannelNotificationOverride? {
@@ -544,7 +821,8 @@ struct GatewayUserGuildSettingsDTO: Decodable {
                     ?? .inherit,
                 isMuted: muted ?? false,
                 muteConfiguration: muteConfig?.domain,
-                flags: flags ?? 0
+                flags: flags ?? 0,
+                isCollapsed: collapsed
             )
         }
     }
@@ -687,10 +965,10 @@ struct ReadyMergedMemberDTO: Decodable {
 struct GatewayGuildCatalogDTO: Decodable {
     var id: String
     var rulesChannelID: String?
-    var channels: [ChannelDTO]
-    var threads: [ChannelDTO]
-    var roles: [GuildRoleDTO]
-    var members: [GuildMemberDTO]
+    var channels: [ChannelDTO]?
+    var threads: [ChannelDTO]?
+    var roles: [GuildRoleDTO]?
+    var members: [GuildMemberDTO]?
 
     enum CodingKeys: String, CodingKey {
         case id, channels, threads, roles, members
@@ -701,22 +979,18 @@ struct GatewayGuildCatalogDTO: Decodable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(String.self, forKey: .id)
         rulesChannelID = try values.decodeIfPresent(String.self, forKey: .rulesChannelID)
-        channels =
-            try values.decodeIfPresent(
-                LossyList<ChannelDTO>.self, forKey: .channels
-            )?.elements ?? []
-        threads =
-            try values.decodeIfPresent(
-                LossyList<ChannelDTO>.self, forKey: .threads
-            )?.elements ?? []
-        roles =
-            try values.decodeIfPresent(
-                LossyList<GuildRoleDTO>.self, forKey: .roles
-            )?.elements ?? []
-        members =
-            try values.decodeIfPresent(
-                LossyList<GuildMemberDTO>.self, forKey: .members
-            )?.elements ?? []
+        channels = try values.decodeIfPresent(
+            LossyList<ChannelDTO>.self, forKey: .channels
+        )?.elements
+        threads = try values.decodeIfPresent(
+            LossyList<ChannelDTO>.self, forKey: .threads
+        )?.elements
+        roles = try values.decodeIfPresent(
+            LossyList<GuildRoleDTO>.self, forKey: .roles
+        )?.elements
+        members = try values.decodeIfPresent(
+            LossyList<GuildMemberDTO>.self, forKey: .members
+        )?.elements
     }
 }
 
