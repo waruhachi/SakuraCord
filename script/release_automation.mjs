@@ -8,6 +8,17 @@ import { fileURLToPath } from "node:url";
 
 export const RELEASE_ACTION_MARKER = "<!-- sakuracord-release-action:v1 -->";
 const DISCORD_API = "https://discord.com/api/v10";
+const REGULAR_RELEASE_COLOR = 0xce6096;
+const NIGHTLY_RELEASE_COLOR = 0x5865f2;
+
+export function isNightlyReleaseTag(tagName) {
+  return /^v\d+\.\d+\.\d+-Beta-\d+$/.test(tagName);
+}
+
+export function releaseDisplayName(tagName) {
+  const match = /^v(\d+\.\d+\.\d+)-Beta-(\d+)$/.exec(tagName);
+  return match ? `v${match[1]} Beta ${match[2]}` : tagName;
+}
 
 export function validateReleaseCopy(value, expectedTag) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -25,8 +36,10 @@ export function validateReleaseCopy(value, expectedTag) {
   }
   if (value.schemaVersion !== 1) throw new Error("Release copy schemaVersion must be 1.");
   const tagName = requiredString(value.tagName, "tagName");
-  if (!/^v\d+\.\d+\.\d+$/.test(tagName)) {
-    throw new Error("tagName must use vMAJOR.MINOR.PATCH.");
+  if (!/^v\d+\.\d+\.\d+(?:-Beta-\d+)?$/.test(tagName)) {
+    throw new Error(
+      "tagName must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-Beta-NUMBER.",
+    );
   }
   if (expectedTag && tagName !== expectedTag) {
     throw new Error(`Release copy belongs to ${tagName}, not ${expectedTag}.`);
@@ -153,10 +166,14 @@ function stripDiscordMentions(value) {
     .replace(/<@!?&?\d{17,20}>/g, "[mention removed]");
 }
 
-function validateDiscordAnnouncementLayout(value) {
+function validateDiscordAnnouncementLayout(value, tagName) {
   const lines = value.split("\n");
-  if (!/^\*\*.+ 🌸\*\*$/.test(lines[0] ?? "")) {
-    throw new Error("discordAnnouncement must start with a bold feature-specific headline ending in 🌸.");
+  const expectedEmoji = isNightlyReleaseTag(tagName) ? "🌙" : "🌸";
+  const headline = lines[0] ?? "";
+  if (!headline.startsWith("**") || !headline.endsWith(` ${expectedEmoji}**`)) {
+    throw new Error(
+      `discordAnnouncement must start with a bold feature-specific headline ending in ${expectedEmoji}.`,
+    );
   }
   if (lines[1] !== "" || lines[2] !== "**Highlights**") {
     throw new Error(
