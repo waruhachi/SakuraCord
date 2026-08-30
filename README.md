@@ -43,9 +43,9 @@ Mac app.
       Liquid Glass presentation.
     </td>
     <td width="50%" valign="top">
-      <h3>💬 Native conversations</h3>
-      Guild text and announcement channels, DMs and group DMs, voice-channel
-      chat, threads, and forum-post conversations share one native timeline.
+      <h3>⚡ Blazingly fast</h3>
+      Low-level APIs keep the app responsive and every timeline exceptionally
+      fluid, with scrolling no other native Discord client for macOS matches.
     </td>
   </tr>
   <tr>
@@ -60,27 +60,12 @@ Mac app.
       slash commands, and media previews where Discord capability gates allow.
     </td>
   </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <h3>🔐 Local where it matters</h3>
-      Credentials stay in Keychain, account data lives in an isolated GRDB
-      store, and cached media remains on-device.
-    </td>
-    <td width="50%" valign="top">
-      <h3>🧪 Built to be testable</h3>
-      Network-disabled fixtures, deterministic protocol coverage, performance
-      scenes, and sanitized diagnostics support development without a live
-      account.
-    </td>
-  </tr>
 </table>
 
 ## Download
 
-Download the
-[latest versioned SakuraCord DMG](https://github.com/SakuraCordApp/SakuraCord/releases/latest)
-directly, or browse its release notes and assets on
-[GitHub Releases](https://github.com/SakuraCordApp/SakuraCord/releases/latest).
+Download the [latest SakuraCord DMG](https://github.com/SakuraCordApp/SakuraCord/releases/latest)
+for macOS 27 or newer, open it, and move SakuraCord into Applications.
 
 | | |
 | --- | --- |
@@ -96,26 +81,6 @@ are ad-hoc signed rather than notarized, so macOS may require approval from
 SakuraCord is an independent project and is not affiliated with Discord.
 Discord does not provide a supported third-party platform for normal-account
 clients, so compatibility can change as Discord evolves.
-
-## Where the project stands
-
-The current source implements the core native-client path without claiming
-complete parity with Discord:
-
-| Area | Current implementation |
-| --- | --- |
-| **Navigation and conversations** | Server and channel navigation with guild text and announcement channels, DMs and group DMs, voice-channel chat, threads, and forum-post conversations. |
-| **Messages** | Paginated history, sending, editing, deleting, replies, attachments with per-tier size checks and an opt-in Catbox/Litterbox link fallback, drafts, reactions, typing state, read state, and unread navigation. |
-| **Discord content** | Embeds, custom emoji, stickers, GIF search, slash commands and autocomplete, Components V2, dynamic component choices, and interaction modals. Availability is capability-gated where Discord requires it. |
-| **Voice, video, and media** | Native guild voice and video, direct-message calls, device selection, Opus and H.264 transport, DAVE integration, media previews, playback, and a bounded on-device media cache. |
-| **macOS integration** | Native windows, menus, settings, notifications and sounds, notification deep links, Keychain-backed credentials, and account-scoped local persistence. |
-| **Development and support** | Network-disabled fixtures, focused performance scenes, deterministic protocol tests, and an exportable bounded diagnostics log that sanitizes sensitive content. |
-
-Some Discord features and administration surfaces are still intentionally
-absent or incomplete. The plugin SDK and separately signed plugin-host target
-are scaffolding only: the host does not currently load plugins. See the
-[public roadmap](https://roadmap.sakuracord.app) for the live status of planned,
-active, completed, and community-requested work.
 
 ## Build from source
 
@@ -135,21 +100,21 @@ git config --local --get core.hooksPath
 ./script/build_and_run.sh --offline
 ```
 
-Installing the repository hooks is a required one-time setup step for every
-fresh clone, including clones used by coding agents. The installer is
-idempotent and refuses to overwrite a different existing Git hooks path. The
-verification command above must print `.githooks`.
+The hooks command must print `.githooks`. The offline demo does not contact
+Discord and is the safest way to explore the app from source. Developers can
+find authenticated launch modes, focused fixtures, validation commands, and
+local credential guidance in the [development guide](docs/DEVELOPMENT.md).
 
-The application package lives in `App/`, and the convenience workspace is
-`SakuraCord.xcworkspace`.
+## Repository guide
 
-The repository-managed pre-commit hook checks the exact staged index snapshot,
-and pre-push independently checks the committed tips being pushed plus any
-remaining staged Swift snapshot before contacting the remote. Both use
-checksum-verified SwiftFormat and SwiftLint binaries at the repository-pinned
-versions, cached under the ignored `.build/` directory. Existing SwiftFormat
-drift and every SwiftLint violation are rejected under the checked-in strict
-policy.
+| Path | Purpose |
+| --- | --- |
+| `App/` | Native macOS application and plugin-host targets |
+| `Packages/` | Models, Discord protocol, persistence, message rendering, media, and plugin contracts |
+| `Brand/` | Logos, banners, and brand metadata |
+| `Config/` | Application entitlements |
+| `docs/` | Canonical architecture, protocol, testing, development, and release guides |
+| `script/` | Build, test, quality, packaging, and release entry points |
 
 When you deliberately want to open the normal app:
 

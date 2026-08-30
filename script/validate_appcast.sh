@@ -88,7 +88,6 @@ if [[ -z "$ENCLOSURE_SIGNATURE" ]]; then
   echo "The appcast enclosure is missing its Sparkle EdDSA signature." >&2
   exit 1
 fi
-EXPECTED_TAG="${SAKURACORD_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 if [[ -z "$EXPECTED_TAG" || -z "${SAKURACORD_BUILD_NUMBER:-}" || -z "${SAKURACORD_VERSION:-}" ]]; then
   echo "Release tag, build number, and version are required for appcast validation." >&2
   exit 2

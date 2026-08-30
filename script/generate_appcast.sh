@@ -2,19 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-# shellcheck source=worktree_runtime.sh
-source "$ROOT_DIR/script/worktree_runtime.sh"
+# shellcheck source=runtime.sh
+source "$ROOT_DIR/script/runtime.sh"
 # shellcheck source=release_metadata.sh
 source "$ROOT_DIR/script/release_metadata.sh"
 
-if [[ "$SAKURACORD_IS_MAIN_WORKTREE" -ne 1 ]]; then
-  echo "Production appcasts must be generated from the main checkout, not a linked worktree." >&2
-  exit 2
-fi
-
 RELEASE_TAG="${SAKURACORD_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
-if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "SAKURACORD_RELEASE_TAG or GITHUB_REF_NAME must use vMAJOR.MINOR.PATCH." >&2
+if ! sakuracord_is_release_tag "$RELEASE_TAG"; then
+  echo "SAKURACORD_RELEASE_TAG or GITHUB_REF_NAME must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-Beta-NUMBER." >&2
   exit 2
 fi
 if [[ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
