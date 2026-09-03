@@ -46,11 +46,9 @@ manifests.
   and commits are evidence to assess, not proof that an item is complete.
 - Keep documentation canonical. Update an existing source of truth instead of
   duplicating architecture, protocol, workflow, or planning information.
-- Preserve the release-branch invariant: `main` must always be an ancestor of
-  `nightly`. Before pushing `main`, incorporate the same commit into `nightly`
-  without rewriting either branch and push both refs atomically when possible.
-  Never push a regular or beta release tag until its commit is present on the
-  remote `nightly` branch. Follow `docs/RELEASING.md` for the exact sequence.
+- Publish regular releases directly from their intended `main` commit. Beta
+  tags may target another reviewed commit without requiring a dedicated source
+  branch. Follow `docs/RELEASING.md` for the exact sequence.
 
 ## Tests
 
