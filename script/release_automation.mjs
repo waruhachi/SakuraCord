@@ -58,7 +58,7 @@ export function validateReleaseCopy(value, expectedTag) {
       throw new Error("discordAnnouncement must contain between 1 and 3800 characters.");
     }
     copy.discordAnnouncement = stripDiscordMentions(discordAnnouncement);
-    validateDiscordAnnouncementLayout(copy.discordAnnouncement);
+    validateDiscordAnnouncementLayout(copy.discordAnnouncement, tagName);
   }
   return copy;
 }
@@ -88,9 +88,13 @@ export function createDiscordPayload(copy, repository, releaseId, releaseUrl, ro
     content: `<@&${roleId}>`,
     embeds: [
       {
-        title: `SakuraCord ${validated.tagName}`,
+        title: `SakuraCord ${releaseDisplayName(validated.tagName)}${
+          isNightlyReleaseTag(validated.tagName) ? " 🌙" : ""
+        }`,
         description: discordAnnouncement,
-        color: 0xce6096,
+        color: isNightlyReleaseTag(validated.tagName)
+          ? NIGHTLY_RELEASE_COLOR
+          : REGULAR_RELEASE_COLOR,
       },
     ],
     components: [

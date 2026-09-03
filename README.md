@@ -65,7 +65,7 @@ Mac app.
 ## Download
 
 Download the [latest SakuraCord DMG](https://github.com/SakuraCordApp/SakuraCord/releases/latest)
-for macOS 27 or newer, open it, and move SakuraCord into Applications.
+for macOS 26 or newer, open it, and move SakuraCord into Applications.
 
 | | |
 | --- | --- |

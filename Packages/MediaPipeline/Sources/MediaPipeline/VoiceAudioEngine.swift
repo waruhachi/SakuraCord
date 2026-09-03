@@ -631,7 +631,7 @@ final class OpusSampleBufferEncoder: NSObject,
 
     func process(_ sampleBuffer: CMSampleBuffer) {
         guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
-        guard let format = AVAudioFormat(formatDescription: description) else { return }
+        let format = AVAudioFormat(cmAudioFormatDescription: description)
         let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
         guard frameCount > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }

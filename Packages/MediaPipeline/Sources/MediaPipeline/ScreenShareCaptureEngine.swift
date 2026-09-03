@@ -197,9 +197,17 @@ public final class ScreenShareCaptureEngine: NSObject, @unchecked Sendable {
         encodedAudioContinuation.finish()
     }
 
+    @MainActor
+    private static func pickerIsAvailable(_ picker: SCContentSharingPicker) -> Bool {
+        if #available(macOS 27.0, *) {
+            return picker.isAvailable
+        }
+        return true
+    }
+
     public func preparePreview() async throws {
         let picker = await MainActor.run { SCContentSharingPicker.shared }
-        guard await MainActor.run(body: { picker.isAvailable }) else {
+        guard await MainActor.run(body: { Self.pickerIsAvailable(picker) }) else {
             throw ScreenShareCaptureError.unavailable
         }
         await configurePicker(picker)
@@ -207,7 +215,7 @@ public final class ScreenShareCaptureEngine: NSObject, @unchecked Sendable {
 
     public func presentSourcePicker() async {
         let picker = await MainActor.run { SCContentSharingPicker.shared }
-        guard await MainActor.run(body: { picker.isAvailable }) else {
+        guard await MainActor.run(body: { Self.pickerIsAvailable(picker) }) else {
             eventContinuation.yield(.error(ScreenShareCaptureError.unavailable.localizedDescription))
             return
         }
