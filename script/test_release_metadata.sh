@@ -65,4 +65,24 @@ if SAKURACORD_RELEASE_REPOSITORY="waruhachi/SakuraCord/extra" \
   exit 1
 fi
 
+set +e
+VALIDATOR_OUTPUT="$(
+  env -u SAKURACORD_RELEASE_TAG -u GITHUB_REF_NAME \
+    SAKURACORD_VERSION=0.1.0 \
+    "$ROOT_DIR/script/validate_appcast.sh" \
+    "$ROOT_DIR/dist/missing-appcast.xml" \
+    "$ROOT_DIR/dist/missing-release.dmg" 2>&1
+)"
+VALIDATOR_STATUS=$?
+set -e
+if [[ "$VALIDATOR_STATUS" -ne 2 ]]; then
+  echo "Missing release tags must stop appcast validation with status 2." >&2
+  exit 1
+fi
+if [[ "$VALIDATOR_OUTPUT" != \
+  "SAKURACORD_RELEASE_TAG or GITHUB_REF_NAME must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-Beta-NUMBER." ]]; then
+  echo "Unexpected missing release tag validation: $VALIDATOR_OUTPUT" >&2
+  exit 1
+fi
+
 printf 'Release metadata tests passed.\n'

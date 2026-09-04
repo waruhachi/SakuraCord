@@ -67,6 +67,9 @@ jobs:
         with:
           path: release-control
           ref: ${{ github.sha }}
+      - name: Use current appcast validation for release repairs
+        if: github.event_name == 'workflow_dispatch'
+        run: cp release-control/script/validate_appcast.sh script/validate_appcast.sh
       - name: Validate release tag and pre-made copy
         run: |
           release_tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"

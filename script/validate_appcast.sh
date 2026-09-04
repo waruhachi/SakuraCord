@@ -6,6 +6,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$ROOT_DIR/script/release_metadata.sh"
 RELEASE_VERSION="$(sakuracord_release_version "$ROOT_DIR")"
 RELEASE_BASE_URL="$(sakuracord_release_base_url)"
+EXPECTED_TAG="${SAKURACORD_RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
+if ! sakuracord_is_release_tag "$EXPECTED_TAG"; then
+  echo "SAKURACORD_RELEASE_TAG or GITHUB_REF_NAME must use vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-Beta-NUMBER." >&2
+  exit 2
+fi
 DMG_NAME="$(sakuracord_release_dmg_name "$RELEASE_VERSION")"
 APPCAST_PATH="${1:-$ROOT_DIR/dist/appcast.xml}"
 DMG_PATH="${2:-$ROOT_DIR/dist/$DMG_NAME}"
