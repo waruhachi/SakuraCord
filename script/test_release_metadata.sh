@@ -8,6 +8,8 @@ source "$ROOT_DIR/script/release_metadata.sh"
 EXPECTED_NAME="SakuraCord.v0.1.0.dmg"
 ACTUAL_NAME="$(sakuracord_release_dmg_name "0.1.0")"
 ACTUAL_URL_NAME="$(sakuracord_release_dmg_url_name "0.1.0")"
+ACTUAL_TAG_NAME="$(sakuracord_release_dmg_name_from_tag "v0.1.0")"
+ACTUAL_BETA_TAG_NAME="$(sakuracord_release_dmg_name_from_tag "v0.2.0-Beta-3")"
 
 if [[ "$ACTUAL_NAME" != "$EXPECTED_NAME" ]]; then
   echo "Unexpected release DMG name: $ACTUAL_NAME" >&2
@@ -17,12 +19,24 @@ if [[ "$ACTUAL_URL_NAME" != "$EXPECTED_NAME" ]]; then
   echo "Unexpected release DMG URL name: $ACTUAL_URL_NAME" >&2
   exit 1
 fi
+if [[ "$ACTUAL_TAG_NAME" != "$EXPECTED_NAME" ]]; then
+  echo "Unexpected release tag DMG name: $ACTUAL_TAG_NAME" >&2
+  exit 1
+fi
+if [[ "$ACTUAL_BETA_TAG_NAME" != "SakuraCord-v0.2.0-Beta-3.dmg" ]]; then
+  echo "Unexpected beta release tag DMG name: $ACTUAL_BETA_TAG_NAME" >&2
+  exit 1
+fi
 if [[ "$ACTUAL_NAME" == *" "* || "$ACTUAL_NAME" == *"%"* ]]; then
   echo "Release asset names must not be normalized by GitHub." >&2
   exit 1
 fi
 if sakuracord_release_dmg_name "0.1" >/dev/null 2>&1; then
   echo "Invalid release versions must be rejected." >&2
+  exit 1
+fi
+if sakuracord_release_dmg_name_from_tag "0.1.0" >/dev/null 2>&1; then
+  echo "Invalid release tags must be rejected for DMG names." >&2
   exit 1
 fi
 

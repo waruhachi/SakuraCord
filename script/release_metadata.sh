@@ -113,6 +113,18 @@ sakuracord_release_dmg_url_name() {
   sakuracord_release_dmg_name "$version"
 }
 
+sakuracord_release_dmg_name_from_tag() {
+  local tag="$1"
+  local asset_version
+
+  asset_version="$(sakuracord_release_asset_version_from_tag "$tag")" || return
+  if sakuracord_is_nightly_release_tag "$tag"; then
+    printf 'SakuraCord-v%s.dmg\n' "$asset_version"
+  else
+    printf 'SakuraCord.v%s.dmg\n' "$asset_version"
+  fi
+}
+
 sakuracord_release_repository() {
   local repository="${SAKURACORD_RELEASE_REPOSITORY:-SakuraCordApp/SakuraCord}"
 

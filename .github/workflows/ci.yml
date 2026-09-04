@@ -178,7 +178,7 @@ jobs:
         env:
           SAKURACORD_ENABLE_UPDATES: 1
           SPARKLE_ED_PUBLIC_KEY: ${{ secrets.SPARKLE_ED_PUBLIC_KEY }}
-        run: ./script/package_dmg.sh
+        run: SAKURACORD_RELEASE_TAG= ./script/package_dmg.sh "$SAKURACORD_DMG_PATH"
       - name: Generate and validate signed Sparkle appcast
         if: steps.existing_release.outputs.published != 'true'
         env:
